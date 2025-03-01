@@ -62,6 +62,7 @@ app.post("/users/register", async (req, res) => {
     
     res.json(user);
   } catch (error) {
+    console.error("Error in /users/register:", error); // <-- ADD THIS
     res.status(500).json({ error: error.message });
   }
 });
