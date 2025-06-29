@@ -70,30 +70,32 @@ app.post("/users/register", async (req, res) => {
 // User login
 app.post("/users/login", async (req, res) => {
   const { email, password } = req.body;
-  
+  console.log("📥 LOGIN ATTEMPT:", { email, password });
+
   try {
     const user = await prisma.user.findUnique({ where: { email } });
-    
-    // If user not found or password doesn’t match -> error
+
     if (!user) {
+      console.log("❌ No user found with email:", email);
       return res.status(401).json({ error: "Invalid credentials" });
     }
-    
+
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
+      console.log("❌ Password mismatch for:", email);
       return res.status(401).json({ error: "Invalid credentials" });
     }
-    
-    // Generate a token
+
     const token = jwt.sign(
-      { userId: user.id, email: user.email }, 
-      process.env.JWT_SECRET, // from .env
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
-    
-    // Return token to client
+
+    console.log("✅ Login successful:", user.email);
     res.json({ token, userId: user.id, email: user.email });
   } catch (error) {
+    console.error("🔥 Login server error:", error);
     res.status(500).json({ error: error.message });
   }
 });
