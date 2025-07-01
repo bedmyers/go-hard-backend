@@ -184,3 +184,27 @@ app.post("/escrow/milestone/release", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+app.get("/escrows/byUser", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Get all escrows where the user is buyer or seller
+    const escrows = await prisma.escrow.findMany({
+      where: {
+        OR: [
+          { buyerId: userId },
+          { sellerId: userId }
+        ]
+      },
+      include: {
+        milestones: true
+      }
+    });
+
+    res.json(escrows);
+  } catch (error) {
+    console.error("Error fetching escrows:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
