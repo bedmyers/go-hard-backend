@@ -106,18 +106,19 @@ app.post("/users/login", async (req, res) => {
 
 // Create escrow transaction
 app.post("/escrow/create", async (req, res) => {
-  const { buyerId, sellerId, amount, milestones } = req.body;
+  const { buyerId, sellerId, amount, milestones, title } = req.body;
   
   try {
-    const escrow = await prisma.escrow.create({
-      data: {
-        buyerId,
-        sellerId,
-        amount,
-        status: "PENDING",
-        milestones: { create: milestones },
-      },
-    });
+const escrow = await prisma.escrow.create({
+  data: {
+    title, // ✅ new
+    buyerId,
+    sellerId,
+    amount,
+    status: "PENDING",
+    milestones: { create: milestones },
+  },
+});
     res.json(escrow);
   } catch (error) {
     res.status(500).json({ error: error.message });

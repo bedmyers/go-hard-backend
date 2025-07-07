@@ -8,28 +8,28 @@ datasource db {
 }
 
 model User {
-  id       Int     @id @default(autoincrement())
-  email    String  @unique
+  id       Int    @id @default(autoincrement())
+  email    String @unique
   name     String
   password String
 }
 
 model Escrow {
   id                    Int         @id @default(autoincrement())
+  title                 String? // ✅ NEW
   buyerId               Int
   sellerId              Int
   amount                Float
-  status                String      @default("PENDING")
+  status                String
   stripePaymentIntentId String?
-  milestones            Milestone[] @relation("EscrowToMilestone")
+  milestones            Milestone[] @relation("EscrowMilestones") // ✅ Named relation
 }
 
 model Milestone {
-  id         Int     @id @default(autoincrement())
-  escrowId   Int
-  amount     Float
-  released   Boolean @default(false)
-  escrow     Escrow  @relation("EscrowToMilestone", fields: [escrowId], references: [id])
+  id       Int     @id @default(autoincrement())
+  escrowId Int
+  amount   Float
+  released Boolean @default(false)
+
+  escrow Escrow @relation("EscrowMilestones", fields: [escrowId], references: [id]) // ✅ Matches above
 }
-
-
