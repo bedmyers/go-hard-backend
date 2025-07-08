@@ -209,3 +209,32 @@ app.get("/escrows/byUser", authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// User search by name or email
+app.get("/users/search", async (req, res) => {
+  const query = req.query.query?.toLowerCase() || "";
+
+  if (!query) return res.status(400).json({ error: "Missing query param" });
+
+  try {
+    const users = await prisma.user.findMany({
+      where: {
+        OR: [
+          { name: { contains: query, mode: "insensitive" } },
+          { email: { contains: query, mode: "insensitive" } },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+      },
+    });
+
+    res.json(users);
+  } catch (error) {
+    console.error("Error in /users/search:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
