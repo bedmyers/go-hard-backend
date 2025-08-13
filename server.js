@@ -14,7 +14,10 @@ const { authenticateToken } = require("./middleware/auth");
 
 // Initialize app
 const app = express();
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.originalUrl === '/webhooks/stripe') return next(); // let express.raw handle it
+  return express.json()(req, res, next);
+});
 app.use(cors());
 app.use(morgan("dev"));
 
@@ -105,86 +108,113 @@ app.post("/users/login", async (req, res) => {
 // --------------------------------
 
 // Create escrow transaction
-app.post("/escrow/create", async (req, res) => {
-  const { buyerId, sellerId, amount, milestones, title } = req.body;
-  
+app.post("/escrow/create", authenticateToken, async (req, res) => {
+  const { buyerId, sellerId, amount, milestones, title } = req.body; // amount/milestones amounts in DOLLARS from client
   try {
-const escrow = await prisma.escrow.create({
-  data: {
-    title, // ✅ new
-    buyerId,
-    sellerId,
-    amount,
-    status: "PENDING",
-    milestones: { create: milestones },
-  },
-});
+    const escrow = await prisma.escrow.create({
+      data: {
+        title,
+        buyerId,
+        sellerId,
+        amountCents: Math.round(Number(amount) * 100),
+        status: "PENDING",
+        milestones: {
+          create: (milestones ?? []).map(m => ({
+            amountCents: Math.round(Number(m.amount) * 100),
+          })),
+        },
+      },
+    });
     res.json(escrow);
   } catch (error) {
+    console.error("Error in /escrow/create:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
+
 // Fund escrow via Stripe
-app.post("/escrow/fund", async (req, res) => {
+app.post("/escrow/fund", authenticateToken, async (req, res) => {
   const { escrowId, paymentMethodId } = req.body;
-  
+  const userId = req.user.userId;
+
   try {
-    const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+    const escrow = await prisma.escrow.findUnique({ where: { id: Number(escrowId) } });
     if (!escrow) return res.status(404).json({ error: "Escrow not found" });
-    
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(escrow.amount * 100), // always multiply by 100 for cents
+
+    const amount = Number(escrow.amountCents);
+    const idempotencyKey = `fund_${escrowId}_${userId}`;
+
+    const intent = await stripe.paymentIntents.create({
+      amount,
       currency: "usd",
       payment_method: paymentMethodId,
       confirm: true,
-      capture_method: "manual",
-      automatic_payment_methods: {
-        enabled: true,
-        allow_redirects: "never", // prevents Stripe from requiring a return_url
+      capture_method: "manual",                  // authorizes now, capture later
+      automatic_payment_methods: { enabled: true, allow_redirects: "never" },
+      metadata: { escrowId: String(escrowId), buyerId: String(userId) },
+    }, { idempotencyKey });
+
+    await prisma.escrow.update({
+      where: { id: Number(escrowId) },
+      data: {
+        stripePaymentIntentId: intent.id,
+        status: intent.status === "requires_capture" ? "AUTHORIZED" : escrow.status,
       },
     });
-    
-    await prisma.escrow.update({
-      where: { id: escrowId },
-      data: { stripePaymentIntentId: paymentIntent.id },
-    });
-    
-    res.json({ success: true, paymentIntentId: paymentIntent.id });
+
+    if (intent.status === "requires_action") {
+      return res.json({
+        status: "requires_action",
+        clientSecret: intent.client_secret,
+        paymentIntentId: intent.id,
+      });
+    }
+    if (intent.status === "requires_capture") {
+      return res.json({
+        status: "requires_capture",
+        paymentIntentId: intent.id,
+        amountCapturable: intent.amount_capturable,
+      });
+    }
+    return res.json({ status: intent.status, paymentIntentId: intent.id });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error("fund error:", error);
+    res.status(400).json({ message: error.message });
   }
 });
 
+
 // Release milestone payment
-app.post("/escrow/milestone/release", async (req, res) => {
+app.post("/escrow/milestone/release", authenticateToken, async (req, res) => {
   const { escrowId, milestoneId } = req.body;
-  
+
   try {
-    const milestone = await prisma.milestone.findUnique({ where: { id: milestoneId } });
-    if (!milestone || milestone.released) {
-      return res.status(400).json({ error: "Invalid milestone" });
+    const milestone = await prisma.milestone.findUnique({ where: { id: Number(milestoneId) } });
+    if (!milestone || milestone.released) return res.status(400).json({ error: "Invalid milestone" });
+
+    const escrow = await prisma.escrow.findUnique({ where: { id: Number(escrowId) } });
+    if (!escrow || !escrow.stripePaymentIntentId) return res.status(404).json({ error: "Escrow not found" });
+
+    const pi = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
+    if (pi.status !== "requires_capture") return res.status(400).json({ error: `PI not capturable: ${pi.status}` });
+
+    const amount = Number(escrow.amountCents);
+    if (typeof pi.amount_capturable === "number" && amount > pi.amount_capturable) {
+      return res.status(400).json({ error: "Amount exceeds remaining capturable" });
     }
-    
-    const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
-    if (!escrow) return res.status(404).json({ error: "Escrow not found" });
-    
-    // Capture the milestone amount
-    await stripe.paymentIntents.capture(escrow.stripePaymentIntentId, {
-      amount_to_capture: Math.round(milestone.amount * 100),
-    });
-    
-    // Mark the milestone as released
-    await prisma.milestone.update({
-      where: { id: milestoneId },
-      data: { released: true },
-    });
-    
-    res.json({ success: true });
+
+    const cap = await stripe.paymentIntents.capture(pi.id, { amount_to_capture: amount });
+
+    await prisma.milestone.update({ where: { id: Number(milestoneId) }, data: { released: true } });
+
+    res.json({ success: true, paymentIntentId: cap.id, remaining: cap.amount_capturable });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error("release error:", error);
+    res.status(400).json({ error: error.message });
   }
 });
+
 
 app.get("/escrows/byUser", authenticateToken, async (req, res) => {
   try {
@@ -237,4 +267,21 @@ app.get("/users/search", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+app.post("/webhooks/stripe", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) { return res.status(400).send(`Webhook Error: ${err.message}`); }
+
+  if (event.type === "payment_intent.amount_capturable_updated") {
+    // Update DB if you want to reflect capturable amounts
+  }
+  if (event.type === "payment_intent.canceled") {
+    // Mark escrow as canceled/expired
+  }
+  res.json({ received: true });
+});
+
 

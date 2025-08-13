@@ -7,29 +7,54 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum EscrowStatus {
+  PENDING     // created, not funded
+  AUTHORIZED  // PI authorized (requires_capture)
+  COMPLETE    // all milestones captured
+  CANCELED
+}
+
 model User {
-  id       Int    @id @default(autoincrement())
-  email    String @unique
-  name     String
-  password String
+  id              Int      @id @default(autoincrement())
+  email           String   @unique
+  name            String
+  password        String
+  // Back-relations (must match the relation names used on Escrow)
+  escrowsBuying   Escrow[] @relation("Buyer")
+  escrowsSelling  Escrow[] @relation("Seller")
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt @default(now())
 }
 
 model Escrow {
-  id                    Int         @id @default(autoincrement())
-  title                 String? // ✅ NEW
+  id                    Int           @id @default(autoincrement())
+  title                 String?
   buyerId               Int
   sellerId              Int
-  amount                Float
-  status                String
+  amountCents           Int
+  status                EscrowStatus  @default(PENDING)
   stripePaymentIntentId String?
-  milestones            Milestone[] @relation("EscrowMilestones") // ✅ Named relation
+
+  // Milestones relation
+  milestones            Milestone[]   @relation("EscrowMilestones")
+
+  // Buyer/Seller relations (names must match back-refs on User)
+  buyer                 User          @relation("Buyer", fields: [buyerId], references: [id])
+  seller                User          @relation("Seller", fields: [sellerId], references: [id])
+
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt @default(now())
 }
 
 model Milestone {
-  id       Int     @id @default(autoincrement())
-  escrowId Int
-  amount   Float
-  released Boolean @default(false)
+  id          Int      @id @default(autoincrement())
+  escrowId    Int
+  amountCents Int
+  released    Boolean  @default(false)
 
-  escrow Escrow @relation("EscrowMilestones", fields: [escrowId], references: [id]) // ✅ Matches above
+  escrow      Escrow   @relation("EscrowMilestones", fields: [escrowId], references: [id])
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt @default(now())
 }
