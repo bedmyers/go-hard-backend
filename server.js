@@ -109,26 +109,65 @@ app.post("/users/login", async (req, res) => {
 
 // Create escrow transaction
 app.post("/escrow/create", authenticateToken, async (req, res) => {
-  const { buyerId, sellerId, amount, milestones, title } = req.body; // amount/milestones amounts in DOLLARS from client
   try {
-    const escrow = await prisma.escrow.create({
-      data: {
-        title,
-        buyerId,
-        sellerId,
-        amountCents: Math.round(Number(amount) * 100),
-        status: "PENDING",
-        milestones: {
-          create: (milestones ?? []).map(m => ({
-            amountCents: Math.round(Number(m.amount) * 100),
-          })),
-        },
-      },
+    const {
+      title,
+      buyerId,           // optional; we’ll default to the authed user
+      sellerId,          // required
+      amountCents,       // preferred: integer cents
+      amount,            // fallback: dollars (number/string)
+      milestones = []    // [{ amountCents } or { amount }]
+    } = req.body;
+
+    // Coerce/validate ids
+    const buyerIdNum = Number(buyerId ?? req.user.userId);
+    const sellerIdNum = Number(sellerId);
+
+    // Coerce/validate total amount (prefer cents, fallback to dollars)
+    const totalCents = Number.isFinite(Number(amountCents))
+      ? Number(amountCents)
+      : Math.round(Number(amount) * 100);
+
+    if (!buyerIdNum || !sellerIdNum || !Number.isFinite(totalCents) || totalCents <= 0) {
+      return res.status(400).json({
+        error: "Invalid payload: buyerId/sellerId/amountCents (or amount) is required and must be > 0"
+      });
+    }
+
+    // Coerce milestone cents; allow either amountCents or amount
+    const milestoneCreates = milestones.map((m, idx) => {
+      const cents = Number.isFinite(Number(m.amountCents))
+        ? Number(m.amountCents)
+        : Math.round(Number(m.amount) * 100);
+
+      if (!Number.isFinite(cents) || cents <= 0) {
+        throw new Error(`Invalid milestone[${idx}] amount`);
+      }
+      return { amountCents: cents, released: false };
     });
-    res.json(escrow);
+
+    const created = await prisma.escrow.create({
+      data: {
+        title: title ?? null,
+        status: "PENDING",
+        amountCents: totalCents,
+        // IMPORTANT: connect relations (this satisfies Prisma's "buyer is missing")
+        buyer:  { connect: { id: buyerIdNum } },
+        seller: { connect: { id: sellerIdNum } },
+        milestones: { create: milestoneCreates }
+      },
+      include: {
+        milestones: true,
+        // add these if your client needs them now:
+        // buyer: true,
+        // seller: true,
+      }
+    });
+
+    return res.json(created);
   } catch (error) {
     console.error("Error in /escrow/create:", error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -188,27 +227,49 @@ app.post("/escrow/fund", authenticateToken, async (req, res) => {
 // Release milestone payment
 app.post("/escrow/milestone/release", authenticateToken, async (req, res) => {
   const { escrowId, milestoneId } = req.body;
+  const idempotencyKey = `release_${milestoneId}`;
 
   try {
     const milestone = await prisma.milestone.findUnique({ where: { id: Number(milestoneId) } });
-    if (!milestone || milestone.released) return res.status(400).json({ error: "Invalid milestone" });
+    if (!milestone || milestone.released) {
+      return res.status(400).json({ error: "Invalid or already released milestone" });
+    }
 
     const escrow = await prisma.escrow.findUnique({ where: { id: Number(escrowId) } });
-    if (!escrow || !escrow.stripePaymentIntentId) return res.status(404).json({ error: "Escrow not found" });
+    if (!escrow || !escrow.stripePaymentIntentId) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
 
     const pi = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
-    if (pi.status !== "requires_capture") return res.status(400).json({ error: `PI not capturable: ${pi.status}` });
+    if (pi.status !== "requires_capture") {
+      return res.status(400).json({ error: `PI not capturable: ${pi.status}` });
+    }
 
-    const amount = Number(escrow.amountCents);
-    if (typeof pi.amount_capturable === "number" && amount > pi.amount_capturable) {
+    const amountToCapture = Number(milestone.amountCents);
+    if (pi.amount_capturable < amountToCapture) {
       return res.status(400).json({ error: "Amount exceeds remaining capturable" });
     }
 
-    const cap = await stripe.paymentIntents.capture(pi.id, { amount_to_capture: amount });
+    const cap = await stripe.paymentIntents.capture(
+      pi.id,
+      { amount_to_capture: amountToCapture },
+      { idempotencyKey }
+    );
 
-    await prisma.milestone.update({ where: { id: Number(milestoneId) }, data: { released: true } });
+    await prisma.milestone.update({
+      where: { id: Number(milestoneId) },
+      data: { released: true }
+    });
 
-    res.json({ success: true, paymentIntentId: cap.id, remaining: cap.amount_capturable });
+    // If all milestones released, mark escrow COMPLETE
+    const remaining = await prisma.milestone.count({
+      where: { escrowId: Number(escrowId), released: false }
+    });
+    if (remaining === 0) {
+      await prisma.escrow.update({ where: { id: Number(escrowId) }, data: { status: "COMPLETE" } });
+    }
+
+    res.json({ success: true, paymentIntentId: cap.id, amountCaptured: amountToCapture, remainingCapturable: cap.amount_capturable });
   } catch (error) {
     console.error("release error:", error);
     res.status(400).json({ error: error.message });
