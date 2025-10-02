@@ -107,72 +107,93 @@ app.post("/users/login", async (req, res) => {
 //  ESCROW & MILESTONE ENDPOINTS
 // --------------------------------
 
-// Create escrow transaction
 app.post("/escrow/create", authenticateToken, async (req, res) => {
   try {
     const {
       title,
-      buyerId,           // optional; we’ll default to the authed user
-      sellerId,          // required
-      amountCents,       // preferred: integer cents
-      amount,            // fallback: dollars (number/string)
-      milestones = []    // [{ amountCents } or { amount }]
+      buyerId,
+      sellerId,
+      vendorEmail,
+      vendorName,
+      amountCents,
+      amount,
+      milestones = []
     } = req.body;
 
-    // Coerce/validate ids
     const buyerIdNum = Number(buyerId ?? req.user.userId);
-    const sellerIdNum = Number(sellerId);
+    let sellerIdNum = Number(sellerId);
 
-    // Coerce/validate total amount (prefer cents, fallback to dollars)
+    // If sellerId is 0 or invalid, look up or create vendor by email
+    if (!sellerIdNum || sellerIdNum === 0) {
+      if (!vendorEmail) {
+        return res.status(400).json({ 
+          error: "Either sellerId or vendorEmail is required" 
+        });
+      }
+
+      // Try to find existing user by email
+      let vendor = await prisma.user.findUnique({ 
+        where: { email: vendorEmail } 
+      });
+
+      // If vendor doesn't exist, create a placeholder account
+      if (!vendor) {
+        vendor = await prisma.user.create({
+          data: {
+            email: vendorEmail,
+            name: vendorName || vendorEmail,
+            password: "" // They'll set password when they accept the invite
+          }
+        });
+      }
+
+      sellerIdNum = vendor.id;
+    }
+
     const totalCents = Number.isFinite(Number(amountCents))
       ? Number(amountCents)
       : Math.round(Number(amount) * 100);
 
     if (!buyerIdNum || !sellerIdNum || !Number.isFinite(totalCents) || totalCents <= 0) {
       return res.status(400).json({
-        error: "Invalid payload: buyerId/sellerId/amountCents (or amount) is required and must be > 0"
+        error: "Invalid payload: buyerId/sellerId/amountCents is required and must be > 0"
       });
     }
 
-// Coerce milestone cents; allow either amountCents or amount
-const milestoneCreates = milestones.map((m, idx) => {
-  const cents = Number.isFinite(Number(m.amountCents))
-    ? Number(m.amountCents)
-    : Math.round(Number(m.amount) * 100);
+    const milestoneCreates = milestones.map((m, idx) => {
+      const cents = Number.isFinite(Number(m.amountCents))
+        ? Number(m.amountCents)
+        : Math.round(Number(m.amount) * 100);
 
-  if (!Number.isFinite(cents) || cents <= 0) {
-    throw new Error(`Invalid milestone[${idx}] amount`);
-  }
-  
-  const milestoneData = {
-    amountCents: cents,
-    released: false,
-    description: m.description || null,
-    releaseConditions: m.releaseConditions || null
-  };
-  
-  if (m.dueDate) {
-    milestoneData.dueDate = new Date(m.dueDate);
-  }
-  
-  return milestoneData;
-});
+      if (!Number.isFinite(cents) || cents <= 0) {
+        throw new Error(`Invalid milestone[${idx}] amount`);
+      }
+      
+      const milestoneData = {
+        amountCents: cents,
+        released: false,
+        description: m.description || null,
+        releaseConditions: m.releaseConditions || null
+      };
+      
+      if (m.dueDate) {
+        milestoneData.dueDate = new Date(m.dueDate);
+      }
+      
+      return milestoneData;
+    });
 
     const created = await prisma.escrow.create({
       data: {
         title: title ?? null,
         status: "PENDING",
         amountCents: totalCents,
-        // IMPORTANT: connect relations (this satisfies Prisma's "buyer is missing")
-        buyer:  { connect: { id: buyerIdNum } },
+        buyer: { connect: { id: buyerIdNum } },
         seller: { connect: { id: sellerIdNum } },
         milestones: { create: milestoneCreates }
       },
       include: {
-        milestones: true,
-        // add these if your client needs them now:
-        // buyer: true,
-        // seller: true,
+        milestones: true
       }
     });
 
