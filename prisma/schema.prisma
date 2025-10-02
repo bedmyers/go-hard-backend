@@ -48,13 +48,14 @@ model Escrow {
 }
 
 model Milestone {
-  id          Int      @id @default(autoincrement())
-  escrowId    Int
-  amountCents Int
-  released    Boolean  @default(false)
-
-  escrow      Escrow   @relation("EscrowMilestones", fields: [escrowId], references: [id])
-
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt @default(now())
+  id                Int       @id @default(autoincrement())
+  escrowId          Int
+  description       String?
+  amountCents       Int
+  releaseConditions String?
+  dueDate           DateTime?
+  released          Boolean   @default(false)
+  escrow            Escrow    @relation("EscrowMilestones", fields: [escrowId], references: [id])
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt @default(now())
 }

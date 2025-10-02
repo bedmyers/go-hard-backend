@@ -134,17 +134,29 @@ app.post("/escrow/create", authenticateToken, async (req, res) => {
       });
     }
 
-    // Coerce milestone cents; allow either amountCents or amount
-    const milestoneCreates = milestones.map((m, idx) => {
-      const cents = Number.isFinite(Number(m.amountCents))
-        ? Number(m.amountCents)
-        : Math.round(Number(m.amount) * 100);
+// Coerce milestone cents; allow either amountCents or amount
+const milestoneCreates = milestones.map((m, idx) => {
+  const cents = Number.isFinite(Number(m.amountCents))
+    ? Number(m.amountCents)
+    : Math.round(Number(m.amount) * 100);
 
-      if (!Number.isFinite(cents) || cents <= 0) {
-        throw new Error(`Invalid milestone[${idx}] amount`);
-      }
-      return { amountCents: cents, released: false };
-    });
+  if (!Number.isFinite(cents) || cents <= 0) {
+    throw new Error(`Invalid milestone[${idx}] amount`);
+  }
+  
+  const milestoneData = {
+    amountCents: cents,
+    released: false,
+    description: m.description || null,
+    releaseConditions: m.releaseConditions || null
+  };
+  
+  if (m.dueDate) {
+    milestoneData.dueDate = new Date(m.dueDate);
+  }
+  
+  return milestoneData;
+});
 
     const created = await prisma.escrow.create({
       data: {
