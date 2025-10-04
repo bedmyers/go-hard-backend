@@ -52,7 +52,6 @@ app.post("/users/register", async (req, res) => {
   const { email, name, password } = req.body;
   
   try {
-    // Hash the password before storing
     const hashedPassword = await bcrypt.hash(password, 10);
     
     const user = await prisma.user.create({
@@ -63,9 +62,20 @@ app.post("/users/register", async (req, res) => {
       },
     });
     
-    res.json(user);
+    // Generate token for new user
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h" }
+    );
+    
+    res.json({ 
+      token, 
+      userId: user.id, 
+      email: user.email 
+    });
   } catch (error) {
-    console.error("Error in /users/register:", error); // <-- ADD THIS
+    console.error("Error in /users/register:", error);
     res.status(500).json({ error: error.message });
   }
 });
