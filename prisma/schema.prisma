@@ -7,6 +7,16 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ============================================
+// ENUMS
+// ============================================
+
+enum UserType {
+  CUSTOMER
+  VENDOR
+  BOTH
+}
+
 enum EscrowStatus {
   PENDING     // created, not funded
   AUTHORIZED  // PI authorized (requires_capture)
@@ -14,38 +24,138 @@ enum EscrowStatus {
   CANCELED
 }
 
+enum ProjectStatus {
+  PLANNING
+  ACTIVE      // vendors booked, payments in progress
+  COMPLETED
+  CANCELED
+}
+
+enum ProjectVendorStatus {
+  INVITED     // customer added vendor, vendor hasn't accepted
+  ACCEPTED    // vendor accepted
+  PAID        // escrow funded
+  COMPLETED   // service delivered, payment released
+  CANCELED
+}
+
+// ============================================
+// USERS
+// ============================================
+
 model User {
   id              Int      @id @default(autoincrement())
   email           String   @unique
   name            String
   password        String
-  // Back-relations (must match the relation names used on Escrow)
-  escrowsBuying   Escrow[] @relation("Buyer")
-  escrowsSelling  Escrow[] @relation("Seller")
-
+  userType        UserType @default(CUSTOMER)
+  
+  // Vendor-specific fields (null for customers)
+  stripeAccountId String?  @unique  // For Stripe Connect
+  bio             String?
+  services        String[] // ["photography", "catering", "dj"]
+  portfolioUrls   String[] // Can store image URLs
+  location        String?  // "Detroit, MI"
+  phoneNumber     String?
+  
+  // Relations
+  projectsOwned       Project[]        @relation("ProjectOwner")
+  projectVendorRoles  ProjectVendor[]  @relation("VendorUser")
+  escrowsBuying       Escrow[]         @relation("Buyer")
+  escrowsSelling      Escrow[]         @relation("Seller")
+  rfpsCreated         RFP[]  // As customer
+  bidsSubmitted       Bid[]  // As vendor
+  
   createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt @default(now())
+  updatedAt       DateTime @updatedAt
 }
+
+// ============================================
+// PROJECTS
+// ============================================
+
+model Project {
+  id              Int            @id @default(autoincrement())
+  title           String
+  description     String?
+  totalBudget     Int?           // in cents, optional
+  eventDate       DateTime?
+  location        String?
+  pinterestBoard  String?        // URL to Pinterest board
+  status          ProjectStatus  @default(PLANNING)
+  
+  // Owner
+  customerId      Int
+  customer        User           @relation("ProjectOwner", fields: [customerId], references: [id])
+  
+  // Relations
+  vendors         ProjectVendor[]
+  rfps            RFP[]
+  
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+}
+
+// ============================================
+// PROJECT VENDORS (the "booking")
+// ============================================
+
+model ProjectVendor {
+  id              Int                  @id @default(autoincrement())
+  
+  // Links
+  projectId       Int
+  project         Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  vendorId        Int
+  vendor          User                 @relation("VendorUser", fields: [vendorId], references: [id])
+  
+  // Booking details
+  role            String               // "Photographer", "Caterer", "DJ"
+  description     String?              // "Need photos from 2-10pm"
+  amountCents     Int                  // Total amount for this vendor
+  dueDate         DateTime?            // When payment/service is due
+  status          ProjectVendorStatus  @default(INVITED)
+  
+  // Payment
+  escrow          Escrow?              @relation("ProjectVendorEscrow")
+  
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  
+  @@unique([projectId, vendorId])
+}
+
+// ============================================
+// ESCROW (updated)
+// ============================================
 
 model Escrow {
-  id                    Int           @id @default(autoincrement())
-  title                 String?
+  id                    Int                  @id @default(autoincrement())
+  
+  // Links
+  projectVendorId       Int                  @unique
+  projectVendor         ProjectVendor        @relation("ProjectVendorEscrow", fields: [projectVendorId], references: [id], onDelete: Cascade)
+  
   buyerId               Int
   sellerId              Int
+  buyer                 User                 @relation("Buyer", fields: [buyerId], references: [id])
+  seller                User                 @relation("Seller", fields: [sellerId], references: [id])
+  
+  // Payment details
   amountCents           Int
-  status                EscrowStatus  @default(PENDING)
+  status                EscrowStatus         @default(PENDING)
   stripePaymentIntentId String?
-
-  // Milestones relation
-  milestones            Milestone[]   @relation("EscrowMilestones")
-
-  // Buyer/Seller relations (names must match back-refs on User)
-  buyer                 User          @relation("Buyer", fields: [buyerId], references: [id])
-  seller                User          @relation("Seller", fields: [sellerId], references: [id])
-
-  createdAt             DateTime      @default(now())
-  updatedAt             DateTime      @updatedAt @default(now())
+  
+  // Relations
+  milestones            Milestone[]          @relation("EscrowMilestones")
+  
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
 }
+
+// ============================================
+// MILESTONES
+// ============================================
 
 model Milestone {
   id                Int       @id @default(autoincrement())
@@ -55,7 +165,56 @@ model Milestone {
   releaseConditions String?
   dueDate           DateTime?
   released          Boolean   @default(false)
-  escrow            Escrow    @relation("EscrowMilestones", fields: [escrowId], references: [id])
+  
+  escrow            Escrow    @relation("EscrowMilestones", fields: [escrowId], references: [id], onDelete: Cascade)
+  
   createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt @default(now())
+  updatedAt         DateTime  @updatedAt
+}
+
+enum RFPStatus {
+  OPEN
+  AWARDED
+  CLOSED
+}
+
+enum BidStatus {
+  SUBMITTED
+  ACCEPTED
+  REJECTED
+}
+
+model RFP {
+  id          Int       @id @default(autoincrement())
+  projectId   Int
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  customerId  Int
+  customer    User      @relation(fields: [customerId], references: [id])
+  
+  title       String
+  description String
+  budget      Int?      // Optional budget hint in cents
+  deadline    DateTime?
+  status      RFPStatus @default(OPEN)
+  
+  bids        Bid[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Bid {
+  id          Int       @id @default(autoincrement())
+  rfpId       Int
+  rfp         RFP       @relation(fields: [rfpId], references: [id], onDelete: Cascade)
+  vendorId    Int
+  vendor      User      @relation(fields: [vendorId], references: [id])
+  
+  amount      Int       // Bid amount in cents
+  proposal    String    // Vendor's proposal text
+  status      BidStatus @default(SUBMITTED)
+  
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  
+  @@unique([rfpId, vendorId]) // Vendor can only bid once per RFP
 }
