@@ -180,6 +180,124 @@ app.patch("/users/me", authenticateToken, async (req, res) => {
 });
 
 // ============================================
+// STRIPE CONNECT (Vendor Onboarding)
+// ============================================
+
+// Start Connect onboarding for vendor
+app.post("/stripe/connect/onboard", authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ 
+      where: { id: req.user.userId } 
+    });
+    
+    if (user.userType === 'CUSTOMER') {
+      return res.status(403).json({ 
+        error: "Only vendors can onboard to Stripe Connect" 
+      });
+    }
+    
+    let accountId = user.stripeAccountId;
+    
+    // Create Stripe Connect account if vendor doesn't have one
+    if (!accountId) {
+      const account = await stripe.accounts.create({
+        type: 'express',
+        country: 'US',
+        email: user.email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true }
+        },
+        business_type: 'individual',
+        metadata: {
+          userId: String(user.id),
+          userEmail: user.email
+        }
+      });
+      
+      accountId = account.id;
+      
+      // Save to database
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { stripeAccountId: accountId }
+      });
+    }
+    
+    // Create account link for onboarding
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/vendor/onboarding/refresh`,
+      return_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/vendor/onboarding/complete`,
+      type: 'account_onboarding'
+    });
+    
+    res.json({ 
+      url: accountLink.url,
+      accountId 
+    });
+  } catch (error) {
+    console.error("Connect onboarding error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check Connect account status
+app.get("/stripe/connect/status", authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ 
+      where: { id: req.user.userId } 
+    });
+    
+    if (!user.stripeAccountId) {
+      return res.json({ 
+        connected: false,
+        chargesEnabled: false,
+        payoutsEnabled: false
+      });
+    }
+    
+    const account = await stripe.accounts.retrieve(user.stripeAccountId);
+    
+    res.json({
+      connected: true,
+      accountId: user.stripeAccountId,
+      chargesEnabled: account.charges_enabled,
+      payoutsEnabled: account.payouts_enabled,
+      detailsSubmitted: account.details_submitted,
+      requirements: account.requirements
+    });
+  } catch (error) {
+    console.error("Error checking Connect status:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Connect dashboard link (for vendor to manage payouts/settings)
+app.get("/stripe/connect/dashboard", authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ 
+      where: { id: req.user.userId } 
+    });
+    
+    if (!user.stripeAccountId) {
+      return res.status(400).json({ 
+        error: "No Stripe account connected" 
+      });
+    }
+    
+    const loginLink = await stripe.accounts.createLoginLink(
+      user.stripeAccountId
+    );
+    
+    res.json({ url: loginLink.url });
+  } catch (error) {
+    console.error("Error creating dashboard link:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // PROJECT ENDPOINTS
 // ============================================
 
@@ -488,7 +606,7 @@ app.patch("/projects/:projectId/vendors/:vendorId", authenticateToken, async (re
 });
 
 // ============================================
-// ESCROW ENDPOINTS (UPDATED)
+// ESCROW ENDPOINTS (WITH STRIPE CONNECT)
 // ============================================
 
 // Create escrow for a project vendor
@@ -500,7 +618,10 @@ app.post("/project-vendors/:projectVendorId/escrow", authenticateToken, async (r
     // Get the project vendor
     const projectVendor = await prisma.projectVendor.findUnique({
       where: { id: projectVendorId },
-      include: { project: true }
+      include: { 
+        project: true,
+        vendor: true 
+      }
     });
     
     if (!projectVendor) {
@@ -519,6 +640,21 @@ app.post("/project-vendors/:projectVendorId/escrow", authenticateToken, async (r
     
     if (existing) {
       return res.status(400).json({ error: "Escrow already exists for this vendor" });
+    }
+    
+    // Verify vendor has completed Stripe Connect onboarding
+    if (!projectVendor.vendor.stripeAccountId) {
+      return res.status(400).json({ 
+        error: "Vendor must complete Stripe Connect onboarding before escrow can be created" 
+      });
+    }
+    
+    // Verify vendor account is ready to receive payments
+    const vendorAccount = await stripe.accounts.retrieve(projectVendor.vendor.stripeAccountId);
+    if (!vendorAccount.charges_enabled) {
+      return res.status(400).json({ 
+        error: "Vendor's Stripe account is not yet enabled to receive payments" 
+      });
     }
     
     // Prepare milestones
@@ -550,7 +686,7 @@ app.post("/project-vendors/:projectVendorId/escrow", authenticateToken, async (r
       include: {
         milestones: true,
         buyer: { select: { id: true, name: true, email: true } },
-        seller: { select: { id: true, name: true, email: true } }
+        seller: { select: { id: true, name: true, email: true, stripeAccountId: true } }
       }
     });
     
@@ -561,7 +697,7 @@ app.post("/project-vendors/:projectVendorId/escrow", authenticateToken, async (r
   }
 });
 
-// Fund escrow via Stripe
+// Fund escrow via Stripe (with Connect)
 app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
   const { paymentMethodId } = req.body;
   const escrowId = Number(req.params.escrowId);
@@ -572,8 +708,12 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
       where: { id: escrowId },
       include: { 
         projectVendor: { 
-          include: { project: true } 
-        }
+          include: { 
+            project: true,
+            vendor: true 
+          } 
+        },
+        seller: true
       }
     });
     
@@ -586,17 +726,34 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Access denied" });
     }
 
+    // Verify vendor has Stripe account
+    if (!escrow.seller.stripeAccountId) {
+      return res.status(400).json({ 
+        error: "Vendor must complete Stripe Connect onboarding" 
+      });
+    }
+
     const amount = Number(escrow.amountCents);
+    const platformFee = Math.round(amount * 0.025); // 2.5% platform fee
     const idempotencyKey = `fund_${escrowId}_${userId}`;
 
+    // Create payment intent with destination charge (money held in platform account)
     const intent = await stripe.paymentIntents.create({
       amount,
       currency: "usd",
       payment_method: paymentMethodId,
       confirm: true,
-      capture_method: "manual",
+      capture_method: "manual", // Hold the funds
+      application_fee_amount: platformFee,
+      transfer_data: {
+        destination: escrow.seller.stripeAccountId
+      },
       automatic_payment_methods: { enabled: true, allow_redirects: "never" },
-      metadata: { escrowId: String(escrowId), buyerId: String(userId) },
+      metadata: { 
+        escrowId: String(escrowId), 
+        buyerId: String(userId),
+        projectVendorId: String(escrow.projectVendorId)
+      },
     }, { idempotencyKey });
 
     await prisma.escrow.update({
@@ -628,6 +785,7 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
         status: "requires_capture",
         paymentIntentId: intent.id,
         amountCapturable: intent.amount_capturable,
+        platformFee,
       });
     }
     
@@ -638,7 +796,7 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
   }
 });
 
-// Release milestone payment
+// Release milestone payment (automatically transfers to vendor via Connect)
 app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, async (req, res) => {
   const escrowId = Number(req.params.escrowId);
   const milestoneId = Number(req.params.milestoneId);
@@ -654,13 +812,16 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
       where: { id: escrowId },
       include: {
         projectVendor: {
-          include: { project: true }
+          include: { 
+            project: true,
+            vendor: true 
+          }
         }
       }
     });
     
     if (!escrow || !escrow.stripePaymentIntentId) {
-      return res.status(404).json({ error: "Escrow not found" });
+      return res.status(404).json({ error: "Escrow not found or not funded" });
     }
     
     // Check ownership
@@ -678,6 +839,7 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
       return res.status(400).json({ error: "Amount exceeds remaining capturable" });
     }
 
+    // Capture payment - this automatically transfers to vendor via Connect
     const cap = await stripe.paymentIntents.capture(
       pi.id,
       { amount_to_capture: amountToCapture },
@@ -710,7 +872,8 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
       success: true, 
       paymentIntentId: cap.id, 
       amountCaptured: amountToCapture, 
-      remainingCapturable: cap.amount_capturable 
+      remainingCapturable: cap.amount_capturable,
+      message: "Payment captured and transferred to vendor"
     });
   } catch (error) {
     console.error("Release error:", error);
@@ -728,7 +891,7 @@ app.get("/escrow/:escrowId", authenticateToken, async (req, res) => {
       include: {
         milestones: true,
         buyer: { select: { id: true, name: true, email: true } },
-        seller: { select: { id: true, name: true, email: true } },
+        seller: { select: { id: true, name: true, email: true, stripeAccountId: true } },
         projectVendor: {
           include: {
             project: { select: { id: true, title: true, customerId: true } },
@@ -1282,7 +1445,7 @@ app.post("/bids/:bidId/reject", authenticateToken, async (req, res) => {
 // STRIPE WEBHOOKS
 // ============================================
 
-app.post("/webhooks/stripe", express.raw({ type: "application/json" }), (req, res) => {
+app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
   
@@ -1296,6 +1459,13 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), (req, re
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // Handle Connect account events
+  if (event.type === "account.updated") {
+    const account = event.data.object;
+    // Update user's Connect status in database if needed
+    console.log("Connect account updated:", account.id);
+  }
+  
   if (event.type === "payment_intent.amount_capturable_updated") {
     // Update DB if needed
   }
