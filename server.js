@@ -650,12 +650,12 @@ app.post("/project-vendors/:projectVendorId/escrow", authenticateToken, async (r
     }*/
     
     // Verify vendor account is ready to receive payments
-    const vendorAccount = await stripe.accounts.retrieve(projectVendor.vendor.stripeAccountId);
+    /*const vendorAccount = await stripe.accounts.retrieve(projectVendor.vendor.stripeAccountId);
     if (!vendorAccount.charges_enabled) {
       return res.status(400).json({ 
         error: "Vendor's Stripe account is not yet enabled to receive payments" 
       });
-    }
+    }*/
     
     // Prepare milestones
     const milestoneCreates = milestones.map((m, idx) => {
