@@ -642,12 +642,12 @@ app.post("/project-vendors/:projectVendorId/escrow", authenticateToken, async (r
       return res.status(400).json({ error: "Escrow already exists for this vendor" });
     }
     
-    // Verify vendor has completed Stripe Connect onboarding
+    /*// Verify vendor has completed Stripe Connect onboarding
     if (!projectVendor.vendor.stripeAccountId) {
       return res.status(400).json({ 
         error: "Vendor must complete Stripe Connect onboarding before escrow can be created" 
       });
-    }
+    }*/
     
     // Verify vendor account is ready to receive payments
     const vendorAccount = await stripe.accounts.retrieve(projectVendor.vendor.stripeAccountId);
