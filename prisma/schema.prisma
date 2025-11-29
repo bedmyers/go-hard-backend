@@ -186,14 +186,14 @@ enum BidStatus {
 
 model RFP {
   id          Int       @id @default(autoincrement())
-  projectId   Int
-  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId   Int?      // Now optional
+  project     Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   customerId  Int
   customer    User      @relation(fields: [customerId], references: [id])
   
   title       String
   description String
-  budget      Int?      // Optional budget hint in cents
+  budget      Int?
   deadline    DateTime?
   status      RFPStatus @default(OPEN)
   

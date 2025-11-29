@@ -1476,3 +1476,74 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
   
   res.json({ received: true });
 });
+
+// ============================================
+// STANDALONE RFP (no project required)
+// ============================================
+
+// Create RFP without a project
+app.post("/rfps", authenticateToken, async (req, res) => {
+  const { title, description, budget, deadline, projectId } = req.body;
+  
+  try {
+    // If projectId provided, verify ownership
+    if (projectId) {
+      const project = await prisma.project.findUnique({ where: { id: projectId } });
+      if (!project || project.customerId !== req.user.userId) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+    }
+    
+    const rfp = await prisma.rFP.create({
+      data: {
+        customerId: req.user.userId,
+        projectId: projectId || null,
+        title,
+        description,
+        budget: budget ? Number(budget) : null,
+        deadline: deadline ? new Date(deadline) : null
+      },
+      include: {
+        customer: {
+          select: { id: true, name: true, email: true }
+        },
+        project: {
+          select: { id: true, title: true }
+        }
+      }
+    });
+    
+    res.json(rfp);
+  } catch (error) {
+    console.error("Error creating RFP:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all RFPs for current user (across all projects + standalone)
+app.get("/rfps/my", authenticateToken, async (req, res) => {
+  try {
+    const rfps = await prisma.rFP.findMany({
+      where: { customerId: req.user.userId },
+      include: {
+        project: {
+          select: { id: true, title: true }
+        },
+        bids: {
+          include: {
+            vendor: {
+              select: { id: true, name: true, email: true, services: true, location: true }
+            }
+          },
+          orderBy: { createdAt: 'desc' }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    res.json(rfps);
+  } catch (error) {
+    console.error("Error fetching RFPs:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
