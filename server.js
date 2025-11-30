@@ -1096,8 +1096,8 @@ app.get("/rfps/browse", authenticateToken, async (req, res) => {
       where: {
         status: 'OPEN',
         OR: [
-          { deadline: null },              // No deadline set
-          { deadline: { gte: new Date() } } // Future deadline
+          { deadline: null },
+          { deadline: { gte: new Date() } }
         ]
       },
       include: {
@@ -1108,16 +1108,17 @@ app.get("/rfps/browse", authenticateToken, async (req, res) => {
           select: { id: true, title: true, eventDate: true, location: true }
         },
         bids: {
-          select: { id: true } // Just count
+          select: { id: true }
         }
       },
       orderBy: { createdAt: 'desc' },
       take: 50
     });
     
-    res.json(rfps.map(rfp => ({
+    // Remove partial bids array, just send the count
+    res.json(rfps.map(({ bids, ...rfp }) => ({
       ...rfp,
-      bidCount: rfp.bids.length
+      bidCount: bids.length
     })));
   } catch (error) {
     console.error("Error browsing RFPs:", error);
