@@ -1547,3 +1547,29 @@ app.get("/rfps/my", authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Get vendor's own bids
+app.get("/bids/my", authenticateToken, async (req, res) => {
+  try {
+    const bids = await prisma.bid.findMany({
+      where: { vendorId: req.user.userId },
+      include: {
+        rfp: {
+          select: { 
+            id: true, 
+            title: true, 
+            description: true,
+            budget: true,
+            status: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    res.json(bids);
+  } catch (error) {
+    console.error("Error fetching vendor bids:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
