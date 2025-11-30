@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "RFP" ALTER COLUMN "projectId" DROP NOT NULL;
