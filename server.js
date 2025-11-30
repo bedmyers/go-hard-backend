@@ -1087,58 +1087,6 @@ app.get("/projects/:projectId/rfps", authenticateToken, async (req, res) => {
   }
 });
 
-// Get single RFP with all bids
-app.get("/rfps/:rfpId", authenticateToken, async (req, res) => {
-  const rfpId = Number(req.params.rfpId);
-  
-  try {
-    const rfp = await prisma.rFP.findUnique({
-      where: { id: rfpId },
-      include: {
-        customer: {
-          select: { id: true, name: true, email: true }
-        },
-        project: {
-          select: { id: true, title: true, description: true, eventDate: true, location: true }
-        },
-        bids: {
-          include: {
-            vendor: {
-              select: { 
-                id: true, 
-                name: true, 
-                email: true, 
-                bio: true,
-                services: true, 
-                portfolioUrls: true,
-                location: true 
-              }
-            }
-          },
-          orderBy: { amount: 'asc' } // Lowest bids first
-        }
-      }
-    });
-    
-    if (!rfp) {
-      return res.status(404).json({ error: "RFP not found" });
-    }
-    
-    // Check access (customer or vendor who submitted bid)
-    const isCustomer = rfp.customerId === req.user.userId;
-    const hasBid = rfp.bids.some(b => b.vendorId === req.user.userId);
-    
-    if (!isCustomer && !hasBid) {
-      return res.status(403).json({ error: "Access denied" });
-    }
-    
-    res.json(rfp);
-  } catch (error) {
-    console.error("Error fetching RFP:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // Browse open RFPs (for vendors to find work)
 app.get("/rfps/browse", authenticateToken, async (req, res) => {
   const { service } = req.query;
@@ -1544,6 +1492,58 @@ app.get("/rfps/my", authenticateToken, async (req, res) => {
     res.json(rfps);
   } catch (error) {
     console.error("Error fetching RFPs:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single RFP with all bids
+app.get("/rfps/:rfpId", authenticateToken, async (req, res) => {
+  const rfpId = Number(req.params.rfpId);
+  
+  try {
+    const rfp = await prisma.rFP.findUnique({
+      where: { id: rfpId },
+      include: {
+        customer: {
+          select: { id: true, name: true, email: true }
+        },
+        project: {
+          select: { id: true, title: true, description: true, eventDate: true, location: true }
+        },
+        bids: {
+          include: {
+            vendor: {
+              select: { 
+                id: true, 
+                name: true, 
+                email: true, 
+                bio: true,
+                services: true, 
+                portfolioUrls: true,
+                location: true 
+              }
+            }
+          },
+          orderBy: { amount: 'asc' } // Lowest bids first
+        }
+      }
+    });
+    
+    if (!rfp) {
+      return res.status(404).json({ error: "RFP not found" });
+    }
+    
+    // Check access (customer or vendor who submitted bid)
+    const isCustomer = rfp.customerId === req.user.userId;
+    const hasBid = rfp.bids.some(b => b.vendorId === req.user.userId);
+    
+    if (!isCustomer && !hasBid) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    
+    res.json(rfp);
+  } catch (error) {
+    console.error("Error fetching RFP:", error);
     res.status(500).json({ error: error.message });
   }
 });
