@@ -1095,9 +1095,10 @@ app.get("/rfps/browse", authenticateToken, async (req, res) => {
     const rfps = await prisma.rFP.findMany({
       where: {
         status: 'OPEN',
-        deadline: {
-          gte: new Date() // Only future deadlines
-        }
+        OR: [
+          { deadline: null },              // No deadline set
+          { deadline: { gte: new Date() } } // Future deadline
+        ]
       },
       include: {
         customer: {
