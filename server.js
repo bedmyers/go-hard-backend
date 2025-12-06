@@ -1089,15 +1089,25 @@ app.get("/projects/:projectId/rfps", authenticateToken, async (req, res) => {
 
 // Browse open RFPs (for vendors to find work)
 app.get("/rfps/browse", authenticateToken, async (req, res) => {
-  const { service } = req.query;
+  const userId = req.user.userId;
   
   try {
     const rfps = await prisma.rFP.findMany({
       where: {
         status: 'OPEN',
-        OR: [
-          { deadline: null },
-          { deadline: { gte: new Date() } }
+        AND: [
+          {
+            OR: [
+              { deadline: null },
+              { deadline: { gte: new Date() } }
+            ]
+          },
+          {
+            OR: [
+              { visibility: 'PUBLIC' },
+              { invitedVendorIds: { has: userId } }
+            ]
+          }
         ]
       },
       include: {
@@ -1115,7 +1125,6 @@ app.get("/rfps/browse", authenticateToken, async (req, res) => {
       take: 50
     });
     
-    // Remove partial bids array, just send the count
     res.json(rfps.map(({ bids, ...rfp }) => ({
       ...rfp,
       bidCount: bids.length
@@ -1311,12 +1320,34 @@ app.post("/bids/:bidId/accept", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "RFP is no longer open" });
     }
     
+    let projectId = bid.rfp.projectId;
+    
+    // If standalone RFP, create a project first
+    if (!projectId) {
+      const newProject = await prisma.project.create({
+        data: {
+          title: bid.rfp.title,
+          customerId: req.user.userId,
+          eventDate: bid.rfp.eventDate,
+          location: bid.rfp.location,
+          status: 'PLANNING'
+        }
+      });
+      projectId = newProject.id;
+      
+      // Link RFP to the new project
+      await prisma.rFP.update({
+        where: { id: bid.rfp.id },
+        data: { projectId }
+      });
+    }
+    
     // Create ProjectVendor from the bid
     const projectVendor = await prisma.projectVendor.create({
       data: {
-        projectId: bid.rfp.projectId,
+        projectId,
         vendorId: bid.vendorId,
-        role: bid.rfp.title, // Use RFP title as role
+        role: bid.rfp.title,
         description: bid.proposal,
         amountCents: bid.amount,
         status: 'ACCEPTED'
@@ -1324,6 +1355,9 @@ app.post("/bids/:bidId/accept", authenticateToken, async (req, res) => {
       include: {
         vendor: {
           select: { id: true, name: true, email: true }
+        },
+        project: {
+          select: { id: true, title: true }
         }
       }
     });
@@ -1352,7 +1386,9 @@ app.post("/bids/:bidId/accept", authenticateToken, async (req, res) => {
     
     res.json({
       projectVendor,
-      message: "Bid accepted and vendor added to project"
+      message: bid.rfp.projectId 
+        ? "Bid accepted and vendor added to project"
+        : "Bid accepted, project created, and vendor added"
     });
   } catch (error) {
     console.error("Error accepting bid:", error);

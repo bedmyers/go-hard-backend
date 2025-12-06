@@ -184,9 +184,14 @@ enum BidStatus {
   REJECTED
 }
 
+enum RFPVisibility {
+  PUBLIC
+  PRIVATE
+}
+
 model RFP {
   id          Int       @id @default(autoincrement())
-  projectId   Int?      // Now optional
+  projectId   Int?
   project     Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   customerId  Int
   customer    User      @relation(fields: [customerId], references: [id])
@@ -195,7 +200,27 @@ model RFP {
   description String
   budget      Int?
   deadline    DateTime?
-  status      RFPStatus @default(OPEN)
+  status      RFPStatus   @default(OPEN)
+  
+  // Event details
+  eventDate      DateTime?
+  location       String?
+  guestCount     Int?
+  
+  // Style & inspiration
+  inspirationUrl String?
+  styleTags      String[]
+  
+  // Requirements
+  mustHaves      String[]
+  niceToHaves    String[]
+  
+  // Timeline
+  decisionDate   DateTime? 
+  
+  // Visibility
+  visibility       RFPVisibility @default(PUBLIC)
+  invitedVendorIds Int[]
   
   bids        Bid[]
   createdAt   DateTime  @default(now())
