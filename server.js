@@ -1639,3 +1639,41 @@ app.get("/bids/my", authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Invite vendor to RFP (adds to invitedVendorIds)
+app.post("/rfps/:rfpId/invite", authenticateToken, async (req, res) => {
+  const { vendorId } = req.body;
+  const rfpId = Number(req.params.rfpId);
+  
+  try {
+    const rfp = await prisma.rFP.findUnique({ where: { id: rfpId } });
+    
+    if (!rfp) {
+      return res.status(404).json({ error: "RFP not found" });
+    }
+    
+    if (rfp.customerId !== req.user.userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    
+    // Add vendor to invited list if not already there
+    const currentInvited = rfp.invitedVendorIds || [];
+    if (currentInvited.includes(vendorId)) {
+      return res.json({ message: "Vendor already invited" });
+    }
+    
+    await prisma.rFP.update({
+      where: { id: rfpId },
+      data: {
+        invitedVendorIds: [...currentInvited, vendorId]
+      }
+    });
+    
+    // TODO: Send notification/email to vendor
+    
+    res.json({ message: "Vendor invited successfully" });
+  } catch (error) {
+    console.error("Error inviting vendor:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
