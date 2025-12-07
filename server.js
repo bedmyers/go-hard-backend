@@ -1469,7 +1469,24 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
 
 // Create RFP without a project
 app.post("/rfps", authenticateToken, async (req, res) => {
-  const { title, description, budget, deadline, projectId } = req.body;
+  const { 
+    title, 
+    description, 
+    budget, 
+    deadline, 
+    projectId,
+    // New fields
+    eventDate,
+    location,
+    guestCount,
+    inspirationUrl,
+    styleTags,
+    mustHaves,
+    niceToHaves,
+    decisionDate,
+    visibility,
+    invitedVendorIds
+  } = req.body;
   
   try {
     // If projectId provided, verify ownership
@@ -1487,7 +1504,18 @@ app.post("/rfps", authenticateToken, async (req, res) => {
         title,
         description,
         budget: budget ? Number(budget) : null,
-        deadline: deadline ? new Date(deadline) : null
+        deadline: deadline ? new Date(deadline) : null,
+        // New fields
+        eventDate: eventDate ? new Date(eventDate) : null,
+        location: location || null,
+        guestCount: guestCount ? Number(guestCount) : null,
+        inspirationUrl: inspirationUrl || null,
+        styleTags: styleTags || [],
+        mustHaves: mustHaves || [],
+        niceToHaves: niceToHaves || [],
+        decisionDate: decisionDate ? new Date(decisionDate) : null,
+        visibility: visibility || 'PUBLIC',
+        invitedVendorIds: invitedVendorIds || []
       },
       include: {
         customer: {
