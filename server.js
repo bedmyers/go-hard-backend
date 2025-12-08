@@ -1677,3 +1677,118 @@ app.post("/rfps/:rfpId/invite", authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================
+// MESSAGING ENDPOINTS
+// ============================================
+
+// Get all conversations (list of people you've messaged with)
+app.get("/conversations", authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  
+  try {
+    // Get all messages where user is sender or receiver
+    const messages = await prisma.message.findMany({
+      where: {
+        OR: [
+          { senderId: userId },
+          { receiverId: userId }
+        ]
+      },
+      include: {
+        sender: { select: { id: true, name: true, userType: true } },
+        receiver: { select: { id: true, name: true, userType: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    // Group by conversation partner
+    const conversationMap = new Map();
+    
+    for (const msg of messages) {
+      const partnerId = msg.senderId === userId ? msg.receiverId : msg.senderId;
+      const partner = msg.senderId === userId ? msg.receiver : msg.sender;
+      
+      if (!conversationMap.has(partnerId)) {
+        const unreadCount = await prisma.message.count({
+          where: {
+            senderId: partnerId,
+            receiverId: userId,
+            read: false
+          }
+        });
+        
+        conversationMap.set(partnerId, {
+          partner,
+          lastMessage: msg,
+          unreadCount
+        });
+      }
+    }
+    
+    res.json(Array.from(conversationMap.values()));
+  } catch (error) {
+    console.error("Error fetching conversations:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get messages with a specific user
+app.get("/messages/:userId", authenticateToken, async (req, res) => {
+  const currentUserId = req.user.userId;
+  const otherUserId = Number(req.params.userId);
+  
+  try {
+    const messages = await prisma.message.findMany({
+      where: {
+        OR: [
+          { senderId: currentUserId, receiverId: otherUserId },
+          { senderId: otherUserId, receiverId: currentUserId }
+        ]
+      },
+      include: {
+        sender: { select: { id: true, name: true } }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+    
+    // Mark messages as read
+    await prisma.message.updateMany({
+      where: {
+        senderId: otherUserId,
+        receiverId: currentUserId,
+        read: false
+      },
+      data: { read: true }
+    });
+    
+    res.json(messages);
+  } catch (error) {
+    console.error("Error fetching messages:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Send a message
+app.post("/messages", authenticateToken, async (req, res) => {
+  const { receiverId, content } = req.body;
+  
+  try {
+    const message = await prisma.message.create({
+      data: {
+        senderId: req.user.userId,
+        receiverId: Number(receiverId),
+        content
+      },
+      include: {
+        sender: { select: { id: true, name: true } },
+        receiver: { select: { id: true, name: true } }
+      }
+    });
+    
+    res.json(message);
+  } catch (error) {
+    console.error("Error sending message:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
