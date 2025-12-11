@@ -129,7 +129,12 @@ app.get("/users/me", authenticateToken, async (req, res) => {
         portfolioUrls: true,
         location: true,
         phoneNumber: true,
-        stripeAccountId: true
+        stripeAccountId: true,
+        profileImageUrl: true,
+        startingPrice: true,
+        instagramHandle: true,
+        websiteUrl: true,
+        yearsInBusiness: true
       }
     });
     
@@ -146,7 +151,7 @@ app.get("/users/me", authenticateToken, async (req, res) => {
 
 // Update user profile
 app.patch("/users/me", authenticateToken, async (req, res) => {
-  const { name, bio, services, portfolioUrls, location, phoneNumber } = req.body;
+  const { name, bio, services, portfolioUrls, location, phoneNumber, profileImageUrl, startingPrice, instagramHandle, websiteUrl, yearsInBusiness } = req.body;
   
   try {
     const user = await prisma.user.update({
@@ -157,7 +162,12 @@ app.patch("/users/me", authenticateToken, async (req, res) => {
         ...(services && { services }),
         ...(portfolioUrls && { portfolioUrls }),
         ...(location !== undefined && { location }),
-        ...(phoneNumber !== undefined && { phoneNumber })
+        ...(phoneNumber !== undefined && { phoneNumber }),
+        ...(profileImageUrl !== undefined && { profileImageUrl }),
+        ...(startingPrice !== undefined && { startingPrice: startingPrice ? Number(startingPrice) : null }),
+        ...(instagramHandle !== undefined && { instagramHandle }),
+        ...(websiteUrl !== undefined && { websiteUrl }),
+        ...(yearsInBusiness !== undefined && { yearsInBusiness: yearsInBusiness ? Number(yearsInBusiness) : null })
       },
       select: {
         id: true,
@@ -168,7 +178,12 @@ app.patch("/users/me", authenticateToken, async (req, res) => {
         services: true,
         portfolioUrls: true,
         location: true,
-        phoneNumber: true
+        phoneNumber: true,
+        profileImageUrl: true,
+        startingPrice: true,
+        instagramHandle: true,
+        websiteUrl: true,
+        yearsInBusiness: true
       }
     });
     
@@ -952,7 +967,13 @@ app.get("/vendors/search", async (req, res) => {
         bio: true,
         services: true,
         portfolioUrls: true,
-        location: true
+        location: true,
+        stripeAccountId: true,
+        profileImageUrl: true,
+        startingPrice: true,
+        instagramHandle: true,
+        websiteUrl: true,
+        yearsInBusiness: true
       }
     });
     
@@ -979,6 +1000,12 @@ app.get("/vendors/:id", async (req, res) => {
         portfolioUrls: true,
         location: true,
         phoneNumber: true,
+        stripeAccountId: true,
+        profileImageUrl: true,
+        startingPrice: true,
+        instagramHandle: true,
+        websiteUrl: true,
+        yearsInBusiness: true,
         projectVendorRoles: {
           where: { status: 'COMPLETED' },
           select: {

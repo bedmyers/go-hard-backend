@@ -71,6 +71,12 @@ model User {
 
   sentMessages     Message[] @relation("SentMessages")
   receivedMessages Message[] @relation("ReceivedMessages")
+
+  profileImageUrl  String?
+  startingPrice    Int?        // in cents, like other amounts
+  instagramHandle  String?
+  websiteUrl       String?
+  yearsInBusiness  Int?
 }
 
 // ============================================
