@@ -764,7 +764,7 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
 
     const amount = Number(escrow.amountCents);
     const platformFee = Math.round(amount * 0.025); // 2.5% platform fee
-    const idempotencyKey = `fund_${escrowId}_${userId}`;
+    const idempotencyKey = `fund_${escrowId}_${userId}_${Date.now()}`;
 
     // Create payment intent with destination charge (money held in platform account)
     const intent = await stripe.paymentIntents.create({
