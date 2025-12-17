@@ -212,7 +212,21 @@ app.post("/stripe/connect/onboard", authenticateToken, async (req, res) => {
     }
     
     let accountId = user.stripeAccountId;
-    
+
+    // Check if existing account is valid (belongs to current Stripe account)
+    if (accountId) {
+      try {
+        await stripe.accounts.retrieve(accountId);
+      } catch (e) {
+        console.log(`Existing Stripe account ${accountId} invalid, creating new one`);
+        accountId = null;
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { stripeAccountId: null }
+        });
+      }
+    }
+
     // Create Stripe Connect account if vendor doesn't have one
     if (!accountId) {
       const account = await stripe.accounts.create({
