@@ -635,6 +635,103 @@ app.patch("/projects/:projectId/vendors/:vendorId", authenticateToken, async (re
 });
 
 // ============================================
+// VENDOR AGREEMENT ACCEPTANCE
+// ============================================
+
+// Vendor accepts an agreement/invitation
+app.post("/project-vendors/:projectVendorId/accept", authenticateToken, async (req, res) => {
+  const projectVendorId = Number(req.params.projectVendorId);
+  const userId = req.user.userId;
+
+  try {
+    const projectVendor = await prisma.projectVendor.findUnique({
+      where: { id: projectVendorId },
+      include: {
+        project: { select: { id: true, title: true, customerId: true } },
+        vendor: { select: { id: true, name: true, email: true } }
+      }
+    });
+
+    if (!projectVendor) {
+      return res.status(404).json({ error: "Agreement not found" });
+    }
+
+    if (projectVendor.vendorId !== userId) {
+      return res.status(403).json({ error: "You can only accept your own agreements" });
+    }
+
+    if (projectVendor.status !== 'INVITED' && projectVendor.status !== 'PENDING') {
+      return res.status(400).json({ error: "Agreement has already been responded to" });
+    }
+
+    const updated = await prisma.projectVendor.update({
+      where: { id: projectVendorId },
+      data: { status: 'ACCEPTED' },
+      include: {
+        project: { select: { id: true, title: true } },
+        vendor: { select: { id: true, name: true, email: true } },
+        escrow: { include: { milestones: true } }
+      }
+    });
+
+    res.json({
+      success: true,
+      message: "Agreement accepted",
+      projectVendor: updated
+    });
+  } catch (error) {
+    console.error("Error accepting agreement:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Vendor declines an agreement/invitation
+app.post("/project-vendors/:projectVendorId/decline", authenticateToken, async (req, res) => {
+  const projectVendorId = Number(req.params.projectVendorId);
+  const userId = req.user.userId;
+
+  try {
+    const projectVendor = await prisma.projectVendor.findUnique({
+      where: { id: projectVendorId },
+      include: {
+        project: { select: { id: true, title: true } },
+        vendor: { select: { id: true, name: true } }
+      }
+    });
+
+    if (!projectVendor) {
+      return res.status(404).json({ error: "Agreement not found" });
+    }
+
+    if (projectVendor.vendorId !== userId) {
+      return res.status(403).json({ error: "You can only decline your own agreements" });
+    }
+
+    if (projectVendor.status !== 'INVITED' && projectVendor.status !== 'PENDING') {
+      return res.status(400).json({ error: "Agreement has already been responded to" });
+    }
+
+    const updated = await prisma.projectVendor.update({
+      where: { id: projectVendorId },
+      data: { status: 'DECLINED' },
+      include: {
+        project: { select: { id: true, title: true } },
+        vendor: { select: { id: true, name: true, email: true } }
+      }
+    });
+
+    res.json({
+      success: true,
+      message: "Agreement declined",
+      projectVendor: updated
+    });
+  } catch (error) {
+    console.error("Error declining agreement:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // ESCROW ENDPOINTS (WITH STRIPE CONNECT)
 // ============================================
 
