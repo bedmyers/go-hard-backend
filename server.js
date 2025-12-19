@@ -634,6 +634,57 @@ app.patch("/projects/:projectId/vendors/:vendorId", authenticateToken, async (re
   }
 });
 
+// Remove vendor from project
+app.delete("/projects/:projectId/vendors/:vendorId", authenticateToken, async (req, res) => {
+  const projectId = Number(req.params.projectId);
+  const vendorId = Number(req.params.vendorId);
+
+  try {
+    // Check project ownership
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project || project.customerId !== req.user.userId) {
+      return res.status(403).json({ error: "Only the project owner can remove vendors" });
+    }
+
+    // Find the project vendor
+    const projectVendor = await prisma.projectVendor.findFirst({
+      where: { projectId, vendorId },
+      include: { escrow: true }
+    });
+
+    if (!projectVendor) {
+      return res.status(404).json({ error: "Vendor not found on this project" });
+    }
+
+    // Check if escrow is funded
+    if (projectVendor.escrow && projectVendor.escrow.status !== 'PENDING') {
+      return res.status(400).json({
+        error: "Cannot remove vendor after escrow has been funded"
+      });
+    }
+
+    // Delete escrow and milestones first if they exist
+    if (projectVendor.escrow) {
+      await prisma.milestone.deleteMany({
+        where: { escrowId: projectVendor.escrow.id }
+      });
+      await prisma.escrow.delete({
+        where: { id: projectVendor.escrow.id }
+      });
+    }
+
+    // Delete the project vendor
+    await prisma.projectVendor.delete({
+      where: { id: projectVendor.id }
+    });
+
+    res.json({ success: true, message: "Vendor removed from project" });
+  } catch (error) {
+    console.error("Error removing vendor:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============================================
 // VENDOR AGREEMENT ACCEPTANCE
 // ============================================
