@@ -19,8 +19,9 @@ enum UserType {
 
 enum EscrowStatus {
   PENDING     // created, not funded
-  AUTHORIZED  // PI authorized (requires_capture)
-  COMPLETE    // all milestones captured
+  AUTHORIZED  // legacy: PI authorized (requires_capture)
+  FUNDED      // money captured and held in platform account
+  COMPLETE    // all milestones released to vendor
   CANCELED
 }
 

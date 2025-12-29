@@ -914,58 +914,62 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
     const platformFee = Math.round(amount * 0.025); // 2.5% platform fee
     const idempotencyKey = `fund_${escrowId}_${userId}_${Date.now()}`;
 
-    // Create payment intent with destination charge (money held in platform account)
+    // Create payment intent - money goes to platform account (escrow)
+    // We'll transfer to vendor incrementally when milestones are released
     const intent = await stripe.paymentIntents.create({
       amount,
       currency: "usd",
       payment_method: paymentMethodId,
       confirm: true,
-      capture_method: "manual", // Hold the funds
-      application_fee_amount: platformFee,
-      transfer_data: {
-        destination: escrow.seller.stripeAccountId
-      },
+      // No transfer_data - money stays in platform account until milestone release
       automatic_payment_methods: { enabled: true, allow_redirects: "never" },
-      metadata: { 
-        escrowId: String(escrowId), 
+      metadata: {
+        escrowId: String(escrowId),
         buyerId: String(userId),
-        projectVendorId: String(escrow.projectVendorId)
+        projectVendorId: String(escrow.projectVendorId),
+        vendorStripeAccountId: escrow.seller.stripeAccountId,
+        platformFee: String(platformFee)
       },
     }, { idempotencyKey });
 
-    await prisma.escrow.update({
-      where: { id: escrowId },
-      data: {
-        stripePaymentIntentId: intent.id,
-        status: intent.status === "requires_capture" ? "AUTHORIZED" : escrow.status,
-      },
-    });
-    
-    // Update ProjectVendor status
-    if (intent.status === "requires_capture") {
+    // Payment succeeded - money is now in escrow (platform account)
+    if (intent.status === "succeeded") {
+      await prisma.escrow.update({
+        where: { id: escrowId },
+        data: {
+          stripePaymentIntentId: intent.id,
+          status: "FUNDED",
+        },
+      });
+
       await prisma.projectVendor.update({
         where: { id: escrow.projectVendorId },
         data: { status: "PAID" }
       });
+
+      return res.json({
+        status: "funded",
+        paymentIntentId: intent.id,
+        amountFunded: amount,
+        platformFee,
+        message: "Funds are now held in escrow"
+      });
     }
 
     if (intent.status === "requires_action") {
+      // 3D Secure or additional authentication needed
+      await prisma.escrow.update({
+        where: { id: escrowId },
+        data: { stripePaymentIntentId: intent.id },
+      });
+
       return res.json({
         status: "requires_action",
         clientSecret: intent.client_secret,
         paymentIntentId: intent.id,
       });
     }
-    
-    if (intent.status === "requires_capture") {
-      return res.json({
-        status: "requires_capture",
-        paymentIntentId: intent.id,
-        amountCapturable: intent.amount_capturable,
-        platformFee,
-      });
-    }
-    
+
     return res.json({ status: intent.status, paymentIntentId: intent.id });
   } catch (error) {
     console.error("Fund error:", error);
@@ -973,11 +977,11 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
   }
 });
 
-// Release milestone payment (automatically transfers to vendor via Connect)
+// Release milestone payment - transfers funds from platform to vendor
 app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, async (req, res) => {
   const escrowId = Number(req.params.escrowId);
   const milestoneId = Number(req.params.milestoneId);
-  const idempotencyKey = `release_${milestoneId}`;
+  const idempotencyKey = `release_${milestoneId}_${Date.now()}`;
 
   try {
     const milestone = await prisma.milestone.findUnique({ where: { id: milestoneId } });
@@ -985,72 +989,103 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
       return res.status(400).json({ error: "Invalid or already released milestone" });
     }
 
-    const escrow = await prisma.escrow.findUnique({ 
+    const escrow = await prisma.escrow.findUnique({
       where: { id: escrowId },
       include: {
+        milestones: true,
+        seller: true,
         projectVendor: {
-          include: { 
+          include: {
             project: true,
-            vendor: true 
+            vendor: true
           }
         }
       }
     });
-    
+
     if (!escrow || !escrow.stripePaymentIntentId) {
       return res.status(404).json({ error: "Escrow not found or not funded" });
     }
-    
+
+    // Check escrow is funded
+    if (escrow.status !== "FUNDED" && escrow.status !== "AUTHORIZED") {
+      return res.status(400).json({ error: `Escrow not funded. Status: ${escrow.status}` });
+    }
+
     // Check ownership
     if (escrow.projectVendor.project.customerId !== req.user.userId) {
       return res.status(403).json({ error: "Access denied" });
     }
 
-    const pi = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
-    if (pi.status !== "requires_capture") {
-      return res.status(400).json({ error: `Payment not capturable: ${pi.status}` });
+    // Verify vendor has Stripe account
+    if (!escrow.seller.stripeAccountId) {
+      return res.status(400).json({ error: "Vendor Stripe account not set up" });
     }
 
-    const amountToCapture = Number(milestone.amountCents);
-    if (pi.amount_capturable < amountToCapture) {
-      return res.status(400).json({ error: "Amount exceeds remaining capturable" });
+    const amountToTransfer = Number(milestone.amountCents);
+
+    // Calculate platform fee for this milestone (proportional to milestone amount)
+    const totalEscrowAmount = Number(escrow.amountCents);
+    const milestoneProportion = amountToTransfer / totalEscrowAmount;
+    const platformFee = Math.round(totalEscrowAmount * 0.025 * milestoneProportion);
+    const vendorAmount = amountToTransfer - platformFee;
+
+    // Get the charge ID from the PaymentIntent (needed for source_transaction)
+    const paymentIntent = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
+    const chargeId = paymentIntent.latest_charge;
+
+    if (!chargeId) {
+      return res.status(400).json({ error: "No charge found for this payment" });
     }
 
-    // Capture payment - this automatically transfers to vendor via Connect
-    const cap = await stripe.paymentIntents.capture(
-      pi.id,
-      { amount_to_capture: amountToCapture },
-      { idempotencyKey }
-    );
+    // Transfer funds from platform account to vendor's Connect account
+    const transfer = await stripe.transfers.create({
+      amount: vendorAmount,
+      currency: "usd",
+      destination: escrow.seller.stripeAccountId,
+      source_transaction: chargeId,
+      metadata: {
+        escrowId: String(escrowId),
+        milestoneId: String(milestoneId),
+        platformFee: String(platformFee)
+      }
+    }, { idempotencyKey });
 
+    // Mark milestone as released
     await prisma.milestone.update({
       where: { id: milestoneId },
       data: { released: true }
     });
 
+    // Calculate remaining unreleased amount
+    const releasedMilestones = escrow.milestones.filter(m => m.released || m.id === milestoneId);
+    const releasedAmount = releasedMilestones.reduce((sum, m) => sum + m.amountCents, 0);
+    const remainingAmount = totalEscrowAmount - releasedAmount;
+
     // If all milestones released, mark escrow COMPLETE
     const remaining = await prisma.milestone.count({
       where: { escrowId, released: false }
     });
-    
+
     if (remaining === 0) {
-      await prisma.escrow.update({ 
-        where: { id: escrowId }, 
-        data: { status: "COMPLETE" } 
+      await prisma.escrow.update({
+        where: { id: escrowId },
+        data: { status: "COMPLETE" }
       });
-      
+
       await prisma.projectVendor.update({
         where: { id: escrow.projectVendorId },
         data: { status: "COMPLETED" }
       });
     }
 
-    res.json({ 
-      success: true, 
-      paymentIntentId: cap.id, 
-      amountCaptured: amountToCapture, 
-      remainingCapturable: cap.amount_capturable,
-      message: "Payment captured and transferred to vendor"
+    res.json({
+      success: true,
+      transferId: transfer.id,
+      amountTransferred: vendorAmount,
+      platformFee,
+      remainingInEscrow: remainingAmount,
+      message: "Payment transferred to vendor"
     });
   } catch (error) {
     console.error("Release error:", error);
