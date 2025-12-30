@@ -8,6 +8,7 @@ const { PrismaClient } = require("@prisma/client");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const appleSignin = require("apple-signin-auth");
 
 // Import our custom auth middleware
 const { authenticateToken } = require("./middleware/auth");
@@ -111,6 +112,82 @@ app.post("/users/login", async (req, res) => {
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Apple Sign In
+app.post("/auth/apple", async (req, res) => {
+  const { identityToken, user: appleUser, userType = "CUSTOMER" } = req.body;
+
+  if (!identityToken) {
+    return res.status(400).json({ error: "Identity token is required" });
+  }
+
+  try {
+    // Verify the Apple identity token
+    const applePayload = await appleSignin.verifyIdToken(identityToken, {
+      audience: process.env.APPLE_CLIENT_ID, // Your app's bundle ID
+      ignoreExpiration: false,
+    });
+
+    const appleUserId = applePayload.sub; // Apple's unique user ID
+    const email = applePayload.email || appleUser?.email;
+
+    if (!email) {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    // Check if user exists by email
+    let user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user) {
+      // Create new user - Apple only provides name on first sign in
+      const name = appleUser?.name
+        ? `${appleUser.name.firstName || ''} ${appleUser.name.lastName || ''}`.trim()
+        : email.split('@')[0]; // Fallback to email prefix
+
+      // Generate a random password (user won't need it with Apple Sign In)
+      const randomPassword = await bcrypt.hash(Math.random().toString(36), 10);
+
+      user = await prisma.user.create({
+        data: {
+          email,
+          name: name || "Apple User",
+          password: randomPassword,
+          userType,
+        },
+      });
+
+      console.log(`✅ New user created via Apple Sign In: ${email}`);
+    } else {
+      console.log(`✅ Existing user signed in via Apple: ${email}`);
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        userType: user.userType,
+      },
+      isNewUser: !user.createdAt || (Date.now() - new Date(user.createdAt).getTime()) < 5000,
+    });
+  } catch (error) {
+    console.error("Apple Sign In error:", error);
+
+    if (error.message?.includes("invalid")) {
+      return res.status(401).json({ error: "Invalid Apple identity token" });
+    }
+
+    res.status(500).json({ error: "Apple Sign In failed" });
   }
 });
 
