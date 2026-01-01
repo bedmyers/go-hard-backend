@@ -1115,6 +1115,29 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
       return res.status(400).json({ error: "No charge found for this payment" });
     }
 
+    // Check if transfer already exists for this milestone (handles retry after partial failure)
+    const existingTransfers = await stripe.transfers.list({
+      limit: 100,
+    });
+    const alreadyTransferred = existingTransfers.data.find(
+      t => t.metadata?.milestoneId === String(milestoneId)
+    );
+
+    if (alreadyTransferred) {
+      // Transfer already done - just update DB and return success
+      await prisma.milestone.update({
+        where: { id: milestoneId },
+        data: { released: true }
+      });
+
+      return res.json({
+        success: true,
+        transferId: alreadyTransferred.id,
+        amountTransferred: alreadyTransferred.amount,
+        message: "Payment was already transferred - status updated"
+      });
+    }
+
     // Transfer funds from platform account to vendor's Connect account
     const transfer = await stripe.transfers.create({
       amount: vendorAmount,
