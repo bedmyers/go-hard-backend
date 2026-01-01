@@ -1139,17 +1139,34 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
     }
 
     // Transfer funds from platform account to vendor's Connect account
-    const transfer = await stripe.transfers.create({
-      amount: vendorAmount,
-      currency: "usd",
-      destination: escrow.seller.stripeAccountId,
-      source_transaction: chargeId,
-      metadata: {
-        escrowId: String(escrowId),
-        milestoneId: String(milestoneId),
-        platformFee: String(platformFee)
+    let transfer;
+    try {
+      transfer = await stripe.transfers.create({
+        amount: vendorAmount,
+        currency: "usd",
+        destination: escrow.seller.stripeAccountId,
+        source_transaction: chargeId,
+        metadata: {
+          escrowId: String(escrowId),
+          milestoneId: String(milestoneId),
+          platformFee: String(platformFee)
+        }
+      }, { idempotencyKey });
+    } catch (stripeError) {
+      // If transfer fails because funds already transferred, mark as released anyway
+      if (stripeError.message && stripeError.message.includes("must not exceed the source amount")) {
+        console.log(`Milestone ${milestoneId} - funds already transferred, marking as released`);
+        await prisma.milestone.update({
+          where: { id: milestoneId },
+          data: { released: true }
+        });
+        return res.json({
+          success: true,
+          message: "Funds were already transferred - milestone marked as released"
+        });
       }
-    }, { idempotencyKey });
+      throw stripeError;
+    }
 
     // Mark milestone as released
     await prisma.milestone.update({
