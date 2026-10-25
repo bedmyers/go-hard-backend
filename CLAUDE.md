@@ -36,5 +36,13 @@ Static routes MUST come before dynamic routes:
 - STRIPE_WEBHOOK_SECRET
 
 ## Deployment
-Push to GitHub → Railway auto-deploys
-Migrations: `prisma db push` runs on deploy (in package.json start script)
+Merge to `main` → Railway auto-deploys to production
+Migrations: `prisma migrate deploy` runs on startup (in package.json start script).
+Schema changes need a migration file in `prisma/migrations/` — don't use `db push` against production.
+
+## Git Workflow
+- `main` = production. Never push to it directly (it isn't branch-protected, so this is by convention)
+- Branch off `main` for each change: `feat/...`, `fix/...`, `chore/...`
+- Open a PR into `main`, review the diff, merge to deploy; delete the branch after
+- Keep API changes backward compatible with the iOS app version already in users' hands
+- No Claude/AI attribution lines in commits or PRs
