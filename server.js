@@ -788,7 +788,7 @@ app.post("/project-vendors/:projectVendorId/accept", authenticateToken, async (r
       return res.status(403).json({ error: "You can only accept your own agreements" });
     }
 
-    if (projectVendor.status !== 'INVITED' && projectVendor.status !== 'PENDING') {
+    if (projectVendor.status !== 'INVITED') {
       return res.status(400).json({ error: "Agreement has already been responded to" });
     }
 
@@ -835,7 +835,7 @@ app.post("/project-vendors/:projectVendorId/decline", authenticateToken, async (
       return res.status(403).json({ error: "You can only decline your own agreements" });
     }
 
-    if (projectVendor.status !== 'INVITED' && projectVendor.status !== 'PENDING') {
+    if (projectVendor.status !== 'INVITED') {
       return res.status(400).json({ error: "Agreement has already been responded to" });
     }
 
@@ -951,6 +951,29 @@ app.post("/project-vendors/:projectVendorId/escrow", authenticateToken, async (r
   }
 });
 
+// Mark an escrow FUNDED and its booking PAID. Safe to call more than once.
+async function markEscrowFunded(escrow, paymentIntentId) {
+  await prisma.$transaction([
+    prisma.escrow.updateMany({
+      where: { id: escrow.id, status: "PENDING" },
+      data: { status: "FUNDED", stripePaymentIntentId: paymentIntentId },
+    }),
+    prisma.projectVendor.updateMany({
+      where: { id: escrow.projectVendorId, status: { in: ["INVITED", "ACCEPTED"] } },
+      data: { status: "PAID" },
+    }),
+  ]);
+}
+
+// Find a transfer already made for a milestone, e.g. from an earlier request
+// that succeeded at Stripe but failed before our database was updated.
+async function findMilestoneTransfer(destination, milestoneId) {
+  for await (const transfer of stripe.transfers.list({ destination, limit: 100 })) {
+    if (transfer.metadata?.milestoneId === String(milestoneId)) return transfer;
+  }
+  return null;
+}
+
 // Fund escrow via Stripe (with Connect)
 app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
   const { paymentMethodId } = req.body;
@@ -958,38 +981,74 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    const escrow = await prisma.escrow.findUnique({ 
+    const escrow = await prisma.escrow.findUnique({
       where: { id: escrowId },
-      include: { 
-        projectVendor: { 
-          include: { 
+      include: {
+        projectVendor: {
+          include: {
             project: true,
-            vendor: true 
-          } 
+            vendor: true
+          }
         },
         seller: true
       }
     });
-    
+
     if (!escrow) {
       return res.status(404).json({ error: "Escrow not found" });
     }
-    
+
     // Check ownership
     if (escrow.projectVendor.project.customerId !== userId) {
       return res.status(403).json({ error: "Access denied" });
     }
 
+    if (escrow.status !== "PENDING") {
+      return res.status(400).json({ error: "Escrow has already been funded" });
+    }
+
+    if (!paymentMethodId) {
+      return res.status(400).json({ error: "paymentMethodId is required" });
+    }
+
     // Verify vendor has Stripe account
     if (!escrow.seller.stripeAccountId) {
-      return res.status(400).json({ 
-        error: "Vendor must complete Stripe Connect onboarding" 
+      return res.status(400).json({
+        error: "Vendor must complete Stripe Connect onboarding"
       });
+    }
+
+    // An earlier attempt may have left a PaymentIntent behind (e.g. 3D Secure was
+    // started but never finished). Reconcile it so the customer is never charged twice.
+    if (escrow.stripePaymentIntentId) {
+      const previous = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
+
+      if (previous.status === "succeeded") {
+        await markEscrowFunded(escrow, previous.id);
+        return res.json({
+          status: "funded",
+          paymentIntentId: previous.id,
+          amountFunded: previous.amount,
+          message: "Funds are now held in escrow"
+        });
+      }
+
+      if (previous.status === "processing") {
+        return res.status(409).json({ error: "A payment for this escrow is still processing" });
+      }
+
+      // Abandoned attempt - cancel it so it can't complete later alongside a new charge
+      if (previous.status !== "canceled") {
+        await stripe.paymentIntents.cancel(previous.id);
+      }
     }
 
     const amount = Number(escrow.amountCents);
     const platformFee = Math.round(amount * 0.025); // 2.5% platform fee
-    const idempotencyKey = `fund_${escrowId}_${userId}_${Date.now()}`;
+    // The app creates a new PaymentMethod per card submission, so this key makes
+    // retries of the same submission (double taps, network retries) return the
+    // original PaymentIntent instead of charging again.
+    const idempotencyKey = `fund_${escrowId}_${paymentMethodId}`;
 
     // Create payment intent - money goes to platform account (escrow)
     // We'll transfer to vendor incrementally when milestones are released
@@ -1011,18 +1070,7 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
 
     // Payment succeeded - money is now in escrow (platform account)
     if (intent.status === "succeeded") {
-      await prisma.escrow.update({
-        where: { id: escrowId },
-        data: {
-          stripePaymentIntentId: intent.id,
-          status: "FUNDED",
-        },
-      });
-
-      await prisma.projectVendor.update({
-        where: { id: escrow.projectVendorId },
-        data: { status: "PAID" }
-      });
+      await markEscrowFunded(escrow, intent.id);
 
       return res.json({
         status: "funded",
@@ -1058,14 +1106,8 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
 app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, async (req, res) => {
   const escrowId = Number(req.params.escrowId);
   const milestoneId = Number(req.params.milestoneId);
-  const idempotencyKey = `release_${milestoneId}_${Date.now()}`;
 
   try {
-    const milestone = await prisma.milestone.findUnique({ where: { id: milestoneId } });
-    if (!milestone || milestone.released) {
-      return res.status(400).json({ error: "Invalid or already released milestone" });
-    }
-
     const escrow = await prisma.escrow.findUnique({
       where: { id: escrowId },
       include: {
@@ -1080,18 +1122,27 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
       }
     });
 
-    if (!escrow || !escrow.stripePaymentIntentId) {
-      return res.status(404).json({ error: "Escrow not found or not funded" });
-    }
-
-    // Check escrow is funded
-    if (escrow.status !== "FUNDED" && escrow.status !== "AUTHORIZED") {
-      return res.status(400).json({ error: `Escrow not funded. Status: ${escrow.status}` });
+    if (!escrow) {
+      return res.status(404).json({ error: "Escrow not found" });
     }
 
     // Check ownership
     if (escrow.projectVendor.project.customerId !== req.user.userId) {
       return res.status(403).json({ error: "Access denied" });
+    }
+
+    // The milestone must belong to this escrow
+    const milestone = escrow.milestones.find(m => m.id === milestoneId);
+    if (!milestone) {
+      return res.status(404).json({ error: "Milestone not found on this escrow" });
+    }
+    if (milestone.released) {
+      return res.status(400).json({ error: "Milestone already released" });
+    }
+
+    // Check escrow is funded
+    if (!escrow.stripePaymentIntentId || (escrow.status !== "FUNDED" && escrow.status !== "AUTHORIZED")) {
+      return res.status(400).json({ error: `Escrow not funded. Status: ${escrow.status}` });
     }
 
     // Verify vendor has Stripe account
@@ -1115,64 +1166,47 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
       return res.status(400).json({ error: "No charge found for this payment" });
     }
 
-    // Check if transfer already exists for this milestone (handles retry after partial failure)
-    const existingTransfers = await stripe.transfers.list({
-      limit: 100,
-    });
-    const alreadyTransferred = existingTransfers.data.find(
-      t => t.metadata?.milestoneId === String(milestoneId)
-    );
-
-    if (alreadyTransferred) {
-      // Transfer already done - just update DB and return success
-      await prisma.milestone.update({
-        where: { id: milestoneId },
-        data: { released: true }
-      });
-
-      return res.json({
-        success: true,
-        transferId: alreadyTransferred.id,
-        amountTransferred: alreadyTransferred.amount,
-        message: "Payment was already transferred - status updated"
-      });
-    }
-
-    // Transfer funds from platform account to vendor's Connect account
-    let transfer;
-    try {
-      transfer = await stripe.transfers.create({
-        amount: vendorAmount,
-        currency: "usd",
-        destination: escrow.seller.stripeAccountId,
-        source_transaction: chargeId,
-        metadata: {
-          escrowId: String(escrowId),
-          milestoneId: String(milestoneId),
-          platformFee: String(platformFee)
-        }
-      }, { idempotencyKey });
-    } catch (stripeError) {
-      // If transfer fails because funds already transferred, mark as released anyway
-      if (stripeError.message && stripeError.message.includes("must not exceed the source amount")) {
-        console.log(`Milestone ${milestoneId} - funds already transferred, marking as released`);
-        await prisma.milestone.update({
-          where: { id: milestoneId },
-          data: { released: true }
-        });
-        return res.json({
-          success: true,
-          message: "Funds were already transferred - milestone marked as released"
-        });
-      }
-      throw stripeError;
-    }
-
-    // Mark milestone as released
-    await prisma.milestone.update({
-      where: { id: milestoneId },
+    // Atomically claim the milestone so two simultaneous requests can't both pay out
+    const claim = await prisma.milestone.updateMany({
+      where: { id: milestoneId, escrowId, released: false },
       data: { released: true }
     });
+    if (claim.count === 0) {
+      return res.status(409).json({ error: "Milestone is already being released" });
+    }
+
+    // Tied to this release attempt: retries of the same attempt reuse the transfer,
+    // and a failed attempt (which bumps updatedAt below) gets a fresh key.
+    const idempotencyKey = `release_${milestoneId}_${milestone.updatedAt.getTime()}`;
+
+    let transfer;
+    let reusedTransfer = false;
+    try {
+      transfer = await findMilestoneTransfer(escrow.seller.stripeAccountId, milestoneId);
+      reusedTransfer = Boolean(transfer);
+
+      if (!transfer) {
+        // Transfer funds from platform account to vendor's Connect account
+        transfer = await stripe.transfers.create({
+          amount: vendorAmount,
+          currency: "usd",
+          destination: escrow.seller.stripeAccountId,
+          source_transaction: chargeId,
+          metadata: {
+            escrowId: String(escrowId),
+            milestoneId: String(milestoneId),
+            platformFee: String(platformFee)
+          }
+        }, { idempotencyKey });
+      }
+    } catch (stripeError) {
+      // Nothing was paid - release the claim so the customer can try again
+      await prisma.milestone.update({
+        where: { id: milestoneId },
+        data: { released: false }
+      });
+      throw stripeError;
+    }
 
     // Calculate remaining unreleased amount
     const releasedMilestones = escrow.milestones.filter(m => m.released || m.id === milestoneId);
@@ -1185,24 +1219,27 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
     });
 
     if (remaining === 0) {
-      await prisma.escrow.update({
-        where: { id: escrowId },
-        data: { status: "COMPLETE" }
-      });
-
-      await prisma.projectVendor.update({
-        where: { id: escrow.projectVendorId },
-        data: { status: "COMPLETED" }
-      });
+      await prisma.$transaction([
+        prisma.escrow.update({
+          where: { id: escrowId },
+          data: { status: "COMPLETE" }
+        }),
+        prisma.projectVendor.update({
+          where: { id: escrow.projectVendorId },
+          data: { status: "COMPLETED" }
+        })
+      ]);
     }
 
     res.json({
       success: true,
       transferId: transfer.id,
-      amountTransferred: vendorAmount,
+      amountTransferred: transfer.amount,
       platformFee,
       remainingInEscrow: remainingAmount,
-      message: "Payment transferred to vendor"
+      message: reusedTransfer
+        ? "Payment was already transferred - status updated"
+        : "Payment transferred to vendor"
     });
   } catch (error) {
     console.error("Release error:", error);
