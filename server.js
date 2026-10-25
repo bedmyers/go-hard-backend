@@ -1102,6 +1102,53 @@ app.post("/escrow/:escrowId/fund", authenticateToken, async (req, res) => {
   }
 });
 
+// Confirm funding after the customer completes 3D Secure in the app.
+// Checks the PaymentIntent with Stripe rather than trusting the client.
+app.post("/escrow/:escrowId/confirm", authenticateToken, async (req, res) => {
+  const escrowId = Number(req.params.escrowId);
+
+  try {
+    const escrow = await prisma.escrow.findUnique({
+      where: { id: escrowId },
+      include: { projectVendor: { include: { project: true } } }
+    });
+
+    if (!escrow) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+
+    // Check ownership
+    if (escrow.projectVendor.project.customerId !== req.user.userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    if (escrow.status === "FUNDED" || escrow.status === "COMPLETE") {
+      return res.json({ status: "funded", paymentIntentId: escrow.stripePaymentIntentId });
+    }
+
+    if (escrow.status !== "PENDING" || !escrow.stripePaymentIntentId) {
+      return res.status(400).json({ error: "No payment in progress for this escrow" });
+    }
+
+    const intent = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
+
+    if (intent.status === "succeeded") {
+      await markEscrowFunded(escrow, intent.id);
+      return res.json({
+        status: "funded",
+        paymentIntentId: intent.id,
+        amountFunded: intent.amount,
+        message: "Funds are now held in escrow"
+      });
+    }
+
+    return res.json({ status: intent.status, paymentIntentId: intent.id });
+  } catch (error) {
+    console.error("Confirm error:", error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
 // Release milestone payment - transfers funds from platform to vendor
 app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, async (req, res) => {
   const escrowId = Number(req.params.escrowId);
