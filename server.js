@@ -135,9 +135,26 @@ app.post("/users/login", async (req, res) => {
   }
 });
 
+// Most recent Apple token-exchange failure, surfaced by /admin/apple/check
+let lastAppleExchangeError = null;
+
+// Client secret for server-to-server Sign in with Apple calls (token exchange, revocation).
+// Returns null when APPLE_TEAM_ID / APPLE_KEY_ID / APPLE_PRIVATE_KEY aren't configured.
+function appleClientSecret() {
+  const { APPLE_CLIENT_ID, APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_PRIVATE_KEY } = process.env;
+  if (!APPLE_CLIENT_ID || !APPLE_TEAM_ID || !APPLE_KEY_ID || !APPLE_PRIVATE_KEY) return null;
+  return appleSignin.getClientSecret({
+    clientID: APPLE_CLIENT_ID,
+    teamID: APPLE_TEAM_ID,
+    keyIdentifier: APPLE_KEY_ID,
+    // Accept the .p8 pasted with real newlines or with literal "\n"
+    privateKey: APPLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  });
+}
+
 // Apple Sign In
 app.post("/auth/apple", async (req, res) => {
-  const { identityToken, user: appleUser, userType = "CUSTOMER" } = req.body;
+  const { identityToken, authorizationCode, user: appleUser, userType = "CUSTOMER" } = req.body;
 
   if (!identityToken) {
     return res.status(400).json({ error: "Identity token is required" });
@@ -157,8 +174,9 @@ app.post("/auth/apple", async (req, res) => {
       return res.status(400).json({ error: "Email is required" });
     }
 
-    // Check if user exists by email
-    let user = await prisma.user.findUnique({ where: { email } });
+    // Match on Apple's stable id first, then fall back to email (older accounts)
+    let user = await prisma.user.findFirst({ where: { appleUserId, deletedAt: null } })
+      ?? await prisma.user.findUnique({ where: { email } });
 
     if (!user) {
       // Create new user - Apple only provides name on first sign in
@@ -181,6 +199,34 @@ app.post("/auth/apple", async (req, res) => {
       console.log(`✅ New user created via Apple Sign In: ${email}`);
     } else {
       console.log(`✅ Existing user signed in via Apple: ${email}`);
+    }
+
+    // Remember the Apple id, and Apple's refresh token so access can be revoked if the
+    // account is deleted (required by Apple). A failed exchange never blocks sign-in.
+    const appleData = user.appleUserId ? {} : { appleUserId };
+    if (authorizationCode) {
+      try {
+        const clientSecret = appleClientSecret();
+        if (clientSecret) {
+          const tokens = await appleSignin.getAuthorizationToken(authorizationCode, {
+            clientID: process.env.APPLE_CLIENT_ID,
+            clientSecret,
+          });
+          if (tokens?.refresh_token) {
+            appleData.appleRefreshToken = tokens.refresh_token;
+            lastAppleExchangeError = null;
+          } else {
+            lastAppleExchangeError = { at: new Date().toISOString(), error: tokens?.error ?? "no refresh token returned" };
+            console.error("Apple token exchange returned no refresh token:", tokens?.error);
+          }
+        }
+      } catch (err) {
+        lastAppleExchangeError = { at: new Date().toISOString(), error: err.message };
+        console.error("Apple token exchange failed:", err.message);
+      }
+    }
+    if (Object.keys(appleData).length > 0) {
+      user = await prisma.user.update({ where: { id: user.id }, data: appleData });
     }
 
     // Generate JWT token
@@ -323,6 +369,24 @@ app.delete("/users/me", authenticateToken, async (req, res) => {
       }
     }
 
+    // Sign in with Apple: revoke our access so the app is unlinked from their Apple ID.
+    // Accounts that signed in before tokens were stored have nothing to revoke.
+    const account = await prisma.user.findUnique({ where: { id: userId }, select: { appleRefreshToken: true } });
+    if (account?.appleRefreshToken) {
+      try {
+        const clientSecret = appleClientSecret();
+        if (clientSecret) {
+          await appleSignin.revokeAuthorizationToken(account.appleRefreshToken, {
+            clientID: process.env.APPLE_CLIENT_ID,
+            clientSecret,
+            tokenTypeHint: "refresh_token",
+          });
+        }
+      } catch (err) {
+        console.error(`Apple token revocation failed for user ${userId}:`, err.message);
+      }
+    }
+
     const unusablePassword = await bcrypt.hash(crypto.randomUUID(), 10);
 
     await prisma.$transaction([
@@ -351,6 +415,8 @@ app.delete("/users/me", authenticateToken, async (req, res) => {
           websiteUrl: null,
           yearsInBusiness: null,
           stripeAccountId: null,
+          appleUserId: null,
+          appleRefreshToken: null,
           deletedAt: new Date()
         }
       })
@@ -1764,6 +1830,23 @@ app.post("/admin/escrow/:escrowId/resolve", authenticateToken, requireAdmin, asy
     console.error("Admin resolve error:", error);
     res.status(error.status || 400).json({ error: error.message });
   }
+});
+
+// Admin: check the Sign in with Apple setup. Apple doesn't confirm credentials without a
+// real sign-in, so this reports config + whether the key can sign, and how real token
+// exchanges have gone (usersWithAppleToken > 0 after a sign-in means it works end to end).
+app.get("/admin/apple/check", authenticateToken, requireAdmin, async (req, res) => {
+  const missing = ["APPLE_CLIENT_ID", "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY"].filter(name => !process.env[name]);
+  let keyCanSign = false;
+  let keyError = null;
+  try {
+    keyCanSign = Boolean(appleClientSecret());
+  } catch (error) {
+    keyError = error.message;
+  }
+
+  const usersWithAppleToken = await prisma.user.count({ where: { appleRefreshToken: { not: null } } });
+  res.json({ missing, keyCanSign, keyError, usersWithAppleToken, lastExchangeError: lastAppleExchangeError });
 });
 
 // Get escrow details
