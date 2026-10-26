@@ -1186,6 +1186,13 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
     if (milestone.released) {
       return res.status(400).json({ error: "Milestone already released" });
     }
+    if (milestone.refunded) {
+      return res.status(400).json({ error: "Milestone was refunded to the customer" });
+    }
+
+    if (escrow.status === "CANCEL_REQUESTED" || escrow.status === "DISPUTED") {
+      return res.status(400).json({ error: "Releases are paused while a cancellation or dispute is open" });
+    }
 
     // Check escrow is funded
     if (!escrow.stripePaymentIntentId || (escrow.status !== "FUNDED" && escrow.status !== "AUTHORIZED")) {
@@ -1214,8 +1221,9 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
     }
 
     // Atomically claim the milestone so two simultaneous requests can't both pay out
+    // (and so it can't be released after a refund has taken it)
     const claim = await prisma.milestone.updateMany({
-      where: { id: milestoneId, escrowId, released: false },
+      where: { id: milestoneId, escrowId, released: false, refunded: false },
       data: { released: true }
     });
     if (claim.count === 0) {
@@ -1291,6 +1299,378 @@ app.post("/escrow/:escrowId/milestone/:milestoneId/release", authenticateToken, 
   } catch (error) {
     console.error("Release error:", error);
     res.status(400).json({ error: error.message });
+  }
+});
+
+// ============================================
+// CANCELLATION, REFUNDS & DISPUTES
+// ============================================
+//
+// - The vendor can refund the unreleased amount at any time.
+// - The customer can request cancellation; releases are frozen while it's pending.
+//   The vendor accepts (refunds) or declines (becomes a dispute). If the vendor doesn't
+//   answer within CANCEL_RESPONSE_DAYS, the customer can escalate it to a dispute.
+// - An admin (ADMIN_USER_IDS) resolves disputes: refund, release to vendor, or split.
+// - Released milestones are final.
+// - A card chargeback freezes the escrow (DISPUTED) until Stripe closes the dispute.
+
+const CANCEL_RESPONSE_DAYS = 7;
+const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "")
+  .split(",")
+  .map(id => Number(id.trim()))
+  .filter(Boolean);
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_USER_IDS.includes(req.user.userId)) {
+    return res.status(403).json({ error: "Admin only" });
+  }
+  next();
+}
+
+/**
+ * Settle the unreleased part of an escrow: refund `refundCents` to the customer
+ * (all of it when null) and transfer the rest, minus the platform fee, to the vendor.
+ * Only runs if the escrow is in one of `fromStatuses` - moving it out of those
+ * statuses first acts as a lock against releases and double settlements.
+ */
+async function settleEscrow(escrowId, { fromStatuses, refundCents = null, note }) {
+  const escrow = await prisma.escrow.findUnique({
+    where: { id: escrowId },
+    include: { seller: true }
+  });
+  if (!escrow) throw httpError(404, "Escrow not found");
+
+  const lock = await prisma.escrow.updateMany({
+    where: { id: escrowId, status: { in: fromStatuses } },
+    data: { status: "REFUNDED" } // provisional, corrected at the end
+  });
+  if (lock.count === 0) {
+    throw httpError(409, `This escrow can't be settled while it is ${escrow.status}`);
+  }
+
+  // Take every unreleased milestone so none can be released from here on
+  const openMilestones = await prisma.milestone.findMany({
+    where: { escrowId, released: false, refunded: false },
+    select: { id: true }
+  });
+  const frozenIds = openMilestones.map(m => m.id);
+  await prisma.milestone.updateMany({
+    where: { id: { in: frozenIds }, released: false },
+    data: { refunded: true }
+  });
+
+  const undoLock = () => prisma.$transaction([
+    prisma.escrow.update({ where: { id: escrowId }, data: { status: escrow.status } }),
+    prisma.milestone.updateMany({ where: { id: { in: frozenIds } }, data: { refunded: false } })
+  ]);
+
+  // Re-read after the freeze so a release that slipped in just before is counted
+  const milestones = await prisma.milestone.findMany({ where: { escrowId } });
+  const releasedCents = milestones.filter(m => m.released).reduce((sum, m) => sum + m.amountCents, 0);
+  const unreleasedCents = Math.max(0, escrow.amountCents - releasedCents - escrow.refundedAmountCents);
+  const refund = refundCents === null
+    ? unreleasedCents
+    : Math.min(Math.max(0, Math.round(Number(refundCents) || 0)), unreleasedCents);
+  const toVendor = unreleasedCents - refund;
+
+  if (unreleasedCents === 0) {
+    await undoLock();
+    throw httpError(400, "Nothing left in this escrow to settle");
+  }
+  if (toVendor > 0 && !escrow.seller.stripeAccountId) {
+    await undoLock();
+    throw httpError(400, "Vendor Stripe account not set up");
+  }
+
+  let intent;
+  let stripeRefundId = escrow.stripeRefundId;
+  try {
+    intent = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
+    if (refund > 0) {
+      if (intent.status === "requires_capture") {
+        // Legacy authorized-but-uncaptured payment: canceling releases the card hold
+        await stripe.paymentIntents.cancel(intent.id);
+      } else if (intent.status === "succeeded") {
+        const stripeRefund = await stripe.refunds.create({
+          payment_intent: intent.id,
+          amount: refund,
+          metadata: { escrowId: String(escrowId) }
+        }, { idempotencyKey: `refund_${escrowId}_${escrow.updatedAt.getTime()}` });
+        stripeRefundId = stripeRefund.id;
+      } else {
+        throw httpError(400, "This escrow has no completed payment to refund");
+      }
+    }
+  } catch (error) {
+    // Nothing was refunded - put everything back so it can be retried
+    await undoLock();
+    throw error;
+  }
+
+  if (toVendor > 0) {
+    const platformFee = Math.round(toVendor * 0.025);
+    try {
+      await stripe.transfers.create({
+        amount: toVendor - platformFee,
+        currency: "usd",
+        destination: escrow.seller.stripeAccountId,
+        source_transaction: intent.latest_charge,
+        metadata: { escrowId: String(escrowId), settlement: "true", platformFee: String(platformFee) }
+      }, { idempotencyKey: `settle_${escrowId}_${escrow.updatedAt.getTime()}` });
+    } catch (error) {
+      // The refund already went through, so record it and leave the rest for an admin
+      await prisma.escrow.update({
+        where: { id: escrowId },
+        data: {
+          status: "DISPUTED",
+          refundedAmountCents: { increment: refund },
+          stripeRefundId,
+          disputeReason: `Refund done, vendor transfer failed: ${error.message}`
+        }
+      });
+      throw httpError(502, "Refund went through but the vendor transfer failed - flagged for admin review");
+    }
+  }
+
+  const status = toVendor > 0 ? "COMPLETE" : "REFUNDED";
+  await prisma.$transaction([
+    prisma.escrow.update({
+      where: { id: escrowId },
+      data: {
+        status,
+        refundedAmountCents: { increment: refund },
+        stripeRefundId,
+        ...(note ? { disputeReason: note } : {})
+      }
+    }),
+    prisma.projectVendor.update({
+      where: { id: escrow.projectVendorId },
+      data: { status: toVendor > 0 ? "COMPLETED" : "CANCELED" }
+    })
+  ]);
+
+  return { status, refundedCents: refund, transferredCents: toVendor };
+}
+
+// Customer asks to cancel. Unfunded escrows are canceled right away; funded ones
+// wait for the vendor, with releases frozen in the meantime.
+app.post("/escrow/:escrowId/cancel-request", authenticateToken, async (req, res) => {
+  const escrowId = Number(req.params.escrowId);
+  const reason = typeof req.body.reason === "string" ? req.body.reason.trim().slice(0, 1000) : null;
+
+  try {
+    let escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) return res.status(404).json({ error: "Escrow not found" });
+    if (escrow.buyerId !== req.user.userId) return res.status(403).json({ error: "Access denied" });
+
+    if (escrow.status === "PENDING") {
+      // Nothing has been charged yet - clean up any payment attempt and cancel
+      if (escrow.stripePaymentIntentId) {
+        const intent = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
+        if (intent.status === "succeeded") {
+          // The payment just completed - treat it as funded and go through the request flow
+          await markEscrowFunded(escrow, intent.id);
+          escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+        } else if (intent.status === "processing") {
+          return res.status(409).json({ error: "A payment is still processing - try again shortly" });
+        } else if (intent.status !== "canceled") {
+          await stripe.paymentIntents.cancel(intent.id);
+        }
+      }
+
+      if (escrow.status === "PENDING") {
+        await prisma.$transaction([
+          prisma.escrow.update({
+            where: { id: escrowId },
+            data: { status: "CANCELED", cancelReason: reason, cancelRequestedById: req.user.userId, cancelRequestedAt: new Date() }
+          }),
+          prisma.projectVendor.update({ where: { id: escrow.projectVendorId }, data: { status: "CANCELED" } })
+        ]);
+        return res.json({ status: "CANCELED", message: "Escrow canceled - nothing was charged" });
+      }
+    }
+
+    if (escrow.status !== "FUNDED" && escrow.status !== "AUTHORIZED") {
+      return res.status(400).json({ error: `Can't request cancellation while the escrow is ${escrow.status}` });
+    }
+
+    const updated = await prisma.escrow.updateMany({
+      where: { id: escrowId, status: { in: ["FUNDED", "AUTHORIZED"] } },
+      data: {
+        status: "CANCEL_REQUESTED",
+        cancelReason: reason,
+        cancelRequestedById: req.user.userId,
+        cancelRequestedAt: new Date()
+      }
+    });
+    if (updated.count === 0) return res.status(409).json({ error: "Escrow changed - refresh and try again" });
+
+    res.json({
+      status: "CANCEL_REQUESTED",
+      message: `Cancellation requested. The vendor has ${CANCEL_RESPONSE_DAYS} days to respond.`
+    });
+  } catch (error) {
+    console.error("Cancel request error:", error);
+    res.status(error.status || 400).json({ error: error.message });
+  }
+});
+
+// Customer changes their mind
+app.post("/escrow/:escrowId/cancel-request/withdraw", authenticateToken, async (req, res) => {
+  const escrowId = Number(req.params.escrowId);
+
+  try {
+    const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) return res.status(404).json({ error: "Escrow not found" });
+    if (escrow.buyerId !== req.user.userId) return res.status(403).json({ error: "Access denied" });
+
+    const updated = await prisma.escrow.updateMany({
+      where: { id: escrowId, status: "CANCEL_REQUESTED" },
+      data: { status: "FUNDED", cancelReason: null, cancelRequestedById: null, cancelRequestedAt: null }
+    });
+    if (updated.count === 0) return res.status(400).json({ error: "There's no pending cancellation to withdraw" });
+
+    res.json({ status: "FUNDED", message: "Cancellation withdrawn" });
+  } catch (error) {
+    console.error("Withdraw cancel error:", error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Vendor declines the customer's cancellation - it goes to an admin
+app.post("/escrow/:escrowId/cancel-request/decline", authenticateToken, async (req, res) => {
+  const escrowId = Number(req.params.escrowId);
+  const reason = typeof req.body.reason === "string" ? req.body.reason.trim().slice(0, 1000) : null;
+
+  try {
+    const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) return res.status(404).json({ error: "Escrow not found" });
+    if (escrow.sellerId !== req.user.userId) return res.status(403).json({ error: "Access denied" });
+
+    const updated = await prisma.escrow.updateMany({
+      where: { id: escrowId, status: "CANCEL_REQUESTED" },
+      data: { status: "DISPUTED", disputeReason: reason ? `Vendor declined: ${reason}` : "Vendor declined the cancellation" }
+    });
+    if (updated.count === 0) return res.status(400).json({ error: "There's no pending cancellation to decline" });
+
+    res.json({ status: "DISPUTED", message: "Cancellation declined - Go Hard will review and decide" });
+  } catch (error) {
+    console.error("Decline cancel error:", error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Customer escalates when the vendor hasn't responded in time
+app.post("/escrow/:escrowId/escalate", authenticateToken, async (req, res) => {
+  const escrowId = Number(req.params.escrowId);
+
+  try {
+    const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) return res.status(404).json({ error: "Escrow not found" });
+    if (escrow.buyerId !== req.user.userId) return res.status(403).json({ error: "Access denied" });
+    if (escrow.status !== "CANCEL_REQUESTED") {
+      return res.status(400).json({ error: "There's no pending cancellation to escalate" });
+    }
+
+    const deadline = new Date(escrow.cancelRequestedAt.getTime() + CANCEL_RESPONSE_DAYS * 24 * 60 * 60 * 1000);
+    if (new Date() < deadline) {
+      return res.status(400).json({ error: `The vendor has until ${deadline.toISOString()} to respond` });
+    }
+
+    await prisma.escrow.updateMany({
+      where: { id: escrowId, status: "CANCEL_REQUESTED" },
+      data: { status: "DISPUTED", disputeReason: `Vendor did not respond within ${CANCEL_RESPONSE_DAYS} days` }
+    });
+    res.json({ status: "DISPUTED", message: "Escalated - Go Hard will review and decide" });
+  } catch (error) {
+    console.error("Escalate error:", error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Vendor refunds the customer (also how a vendor accepts a cancellation request)
+app.post("/escrow/:escrowId/refund", authenticateToken, async (req, res) => {
+  const escrowId = Number(req.params.escrowId);
+
+  try {
+    const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) return res.status(404).json({ error: "Escrow not found" });
+    if (escrow.sellerId !== req.user.userId) return res.status(403).json({ error: "Access denied" });
+    if (escrow.stripeDisputeId) {
+      return res.status(400).json({ error: "A card chargeback is open on this payment - it has to be resolved through Stripe" });
+    }
+
+    const result = await settleEscrow(escrowId, {
+      fromStatuses: ["FUNDED", "AUTHORIZED", "CANCEL_REQUESTED", "DISPUTED"],
+      refundCents: null,
+      note: "Refunded by vendor"
+    });
+    res.json({ ...result, message: "Refund sent to the customer" });
+  } catch (error) {
+    console.error("Vendor refund error:", error);
+    res.status(error.status || 400).json({ error: error.message });
+  }
+});
+
+// Admin: escrows that need a decision
+app.get("/admin/disputes", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const staleCutoff = new Date(Date.now() - CANCEL_RESPONSE_DAYS * 24 * 60 * 60 * 1000);
+    const escrows = await prisma.escrow.findMany({
+      where: {
+        OR: [
+          { status: "DISPUTED" },
+          { status: "CANCEL_REQUESTED", cancelRequestedAt: { lte: staleCutoff } }
+        ]
+      },
+      include: {
+        milestones: true,
+        buyer: { select: { id: true, name: true, email: true } },
+        seller: { select: { id: true, name: true, email: true } },
+        projectVendor: { select: { role: true, project: { select: { id: true, title: true } } } }
+      },
+      orderBy: { updatedAt: "asc" }
+    });
+    res.json(escrows);
+  } catch (error) {
+    console.error("Admin disputes error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: decide a dispute. outcome = "refund" | "release" | "split" (with refundAmountCents)
+app.post("/admin/escrow/:escrowId/resolve", authenticateToken, requireAdmin, async (req, res) => {
+  const escrowId = Number(req.params.escrowId);
+  const { outcome, refundAmountCents, note } = req.body;
+
+  try {
+    const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) return res.status(404).json({ error: "Escrow not found" });
+    if (escrow.stripeDisputeId) {
+      return res.status(400).json({ error: "A card chargeback is open on this payment - Stripe decides that one" });
+    }
+
+    let refundCents;
+    if (outcome === "refund") refundCents = null;
+    else if (outcome === "release") refundCents = 0;
+    else if (outcome === "split" && Number.isInteger(refundAmountCents) && refundAmountCents >= 0) refundCents = refundAmountCents;
+    else return res.status(400).json({ error: 'outcome must be "refund", "release", or "split" with an integer refundAmountCents' });
+
+    const result = await settleEscrow(escrowId, {
+      fromStatuses: ["DISPUTED", "CANCEL_REQUESTED"],
+      refundCents,
+      note: `Admin decision (${outcome})${note ? `: ${String(note).slice(0, 1000)}` : ""}`
+    });
+    res.json(result);
+  } catch (error) {
+    console.error("Admin resolve error:", error);
+    res.status(error.status || 400).json({ error: error.message });
   }
 });
 
@@ -1905,11 +2285,70 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
         break;
       }
 
-      // Refund and dispute handling isn't built yet - log loudly so these get noticed.
-      case "charge.refunded":
-      case "charge.dispute.created": {
+      // Refunds made through the app are already recorded; this catches ones made in the Stripe dashboard
+      case "charge.refunded": {
         const charge = event.data.object;
-        console.error(`Webhook: ${event.type} on charge ${charge.charge ?? charge.id} (payment ${charge.payment_intent}) - needs manual review`);
+        const escrow = await prisma.escrow.findFirst({ where: { stripePaymentIntentId: charge.payment_intent } });
+        const known = escrow && escrow.refundedAmountCents >= charge.amount_refunded;
+        if (!known) {
+          console.error(`Webhook: charge ${charge.id} refunded ${charge.amount_refunded} outside the app (escrow ${escrow?.id ?? "?"}) - needs manual review`);
+        }
+        break;
+      }
+
+      // Card chargeback: freeze whatever is still in escrow until Stripe decides
+      case "charge.dispute.created": {
+        const dispute = event.data.object;
+        const escrow = await prisma.escrow.findFirst({ where: { stripePaymentIntentId: dispute.payment_intent } });
+        if (!escrow) {
+          console.error(`Webhook: chargeback ${dispute.id} on a payment with no escrow (${dispute.payment_intent})`);
+          break;
+        }
+        const holdsFunds = ["FUNDED", "AUTHORIZED", "CANCEL_REQUESTED", "DISPUTED"].includes(escrow.status);
+        await prisma.escrow.update({
+          where: { id: escrow.id },
+          data: {
+            stripeDisputeId: dispute.id,
+            ...(holdsFunds ? { status: "DISPUTED", disputeReason: `Card chargeback (${dispute.reason})` } : {})
+          }
+        });
+        console.error(`Webhook: chargeback ${dispute.id} on escrow ${escrow.id} (was ${escrow.status}) - respond in the Stripe dashboard`);
+        break;
+      }
+
+      case "charge.dispute.closed": {
+        const dispute = event.data.object;
+        const escrow = await prisma.escrow.findFirst({ where: { stripeDisputeId: dispute.id } });
+        if (!escrow) break;
+
+        if (dispute.status === "won") {
+          // Money stays with us - unfreeze so milestones can be released again
+          await prisma.escrow.update({
+            where: { id: escrow.id },
+            data: {
+              stripeDisputeId: null,
+              ...(escrow.status === "DISPUTED" ? { status: "FUNDED", disputeReason: null } : {})
+            }
+          });
+        } else if (dispute.status === "lost") {
+          // The bank returned the money to the customer - nothing is left to release
+          await prisma.$transaction([
+            prisma.milestone.updateMany({
+              where: { escrowId: escrow.id, released: false },
+              data: { refunded: true }
+            }),
+            prisma.escrow.update({
+              where: { id: escrow.id },
+              data: {
+                status: "REFUNDED",
+                refundedAmountCents: { increment: dispute.amount },
+                disputeReason: `Card chargeback lost (${dispute.reason})`
+              }
+            }),
+            prisma.projectVendor.update({ where: { id: escrow.projectVendorId }, data: { status: "CANCELED" } })
+          ]);
+        }
+        console.log(`Webhook: chargeback ${dispute.id} on escrow ${escrow.id} closed as ${dispute.status}`);
         break;
       }
 
