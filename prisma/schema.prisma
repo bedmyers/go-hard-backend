@@ -23,6 +23,9 @@ enum EscrowStatus {
   FUNDED      // money captured and held in platform account
   COMPLETE    // all milestones released to vendor
   CANCELED
+  CANCEL_REQUESTED  // customer asked to cancel; releases frozen until vendor responds
+  DISPUTED          // vendor declined/ignored a cancel request, or a card chargeback; admin decides
+  REFUNDED          // unreleased funds returned to the customer
 }
 
 enum ProjectStatus {
@@ -156,7 +159,16 @@ model Escrow {
   amountCents           Int
   status                EscrowStatus         @default(PENDING)
   stripePaymentIntentId String?
-  
+
+  // Cancellation / refunds
+  cancelRequestedById   Int?
+  cancelRequestedAt     DateTime?
+  cancelReason          String?
+  disputeReason         String?              // vendor's reason for declining, or admin notes
+  stripeDisputeId       String?              // set when the customer files a card chargeback
+  refundedAmountCents   Int                  @default(0)
+  stripeRefundId        String?
+
   // Relations
   milestones            Milestone[]          @relation("EscrowMilestones")
   
@@ -176,7 +188,8 @@ model Milestone {
   releaseConditions String?
   dueDate           DateTime?
   released          Boolean   @default(false)
-  
+  refunded          Boolean   @default(false)  // returned to the customer instead of released
+
   escrow            Escrow    @relation("EscrowMilestones", fields: [escrowId], references: [id], onDelete: Cascade)
   
   createdAt         DateTime  @default(now())
