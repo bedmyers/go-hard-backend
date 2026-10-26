@@ -84,6 +84,10 @@ model User {
   yearsInBusiness  Int?
 
   deletedAt        DateTime?   // account deleted: personal data wiped, logins rejected
+
+  // Sign in with Apple
+  appleUserId       String?  @unique  // Apple's stable user id ("sub")
+  appleRefreshToken String?           // revoked with Apple when the account is deleted
 }
 
 // ============================================
