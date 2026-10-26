@@ -1857,34 +1857,71 @@ app.post("/bids/:bidId/reject", authenticateToken, async (req, res) => {
 // ============================================
 
 app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!process.env.STRIPE_WEBHOOK_SECRET) {
+    console.error("Stripe webhook received but STRIPE_WEBHOOK_SECRET is not set");
+    return res.status(500).send("Webhook not configured");
+  }
+
   const sig = req.headers["stripe-signature"];
   let event;
-  
+
   try {
     event = stripe.webhooks.constructEvent(
-      req.body, 
-      sig, 
+      req.body,
+      sig,
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Handle Connect account events
-  if (event.type === "account.updated") {
-    const account = event.data.object;
-    // Update user's Connect status in database if needed
-    console.log("Connect account updated:", account.id);
+  try {
+    switch (event.type) {
+      // Backup for /fund and /confirm: if the app closed before reporting back
+      // (e.g. mid 3D Secure), this still marks the escrow funded.
+      case "payment_intent.succeeded": {
+        const intent = event.data.object;
+        const escrowId = Number(intent.metadata?.escrowId);
+        if (!escrowId) break; // not an escrow payment
+
+        const escrow = await prisma.escrow.findUnique({ where: { id: escrowId } });
+        if (!escrow) {
+          console.error(`Webhook: payment ${intent.id} succeeded for missing escrow ${escrowId}`);
+          break;
+        }
+        if (escrow.status === "PENDING") {
+          await markEscrowFunded(escrow, intent.id);
+          console.log(`Webhook: escrow ${escrowId} marked FUNDED from ${intent.id}`);
+        }
+        break;
+      }
+
+      // The escrow stays PENDING so the customer can try again. Abandoned attempts
+      // are canceled by /fund itself, so a cancel doesn't mean the escrow is canceled.
+      case "payment_intent.payment_failed":
+      case "payment_intent.canceled": {
+        const intent = event.data.object;
+        console.log(`Webhook: ${event.type} for escrow ${intent.metadata?.escrowId ?? "?"} (${intent.id})`);
+        break;
+      }
+
+      // Refund and dispute handling isn't built yet - log loudly so these get noticed.
+      case "charge.refunded":
+      case "charge.dispute.created": {
+        const charge = event.data.object;
+        console.error(`Webhook: ${event.type} on charge ${charge.charge ?? charge.id} (payment ${charge.payment_intent}) - needs manual review`);
+        break;
+      }
+
+      default:
+        break;
+    }
+  } catch (err) {
+    // Non-2xx makes Stripe retry the event later
+    console.error(`Webhook handler error for ${event.type}:`, err);
+    return res.status(500).send("Webhook handler failed");
   }
-  
-  if (event.type === "payment_intent.amount_capturable_updated") {
-    // Update DB if needed
-  }
-  
-  if (event.type === "payment_intent.canceled") {
-    // Mark escrow as canceled
-  }
-  
+
   res.json({ received: true });
 });
 
