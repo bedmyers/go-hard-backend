@@ -9,9 +9,29 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const appleSignin = require("apple-signin-auth");
+const crypto = require("crypto");
 
 // Import our custom auth middleware
-const { authenticateToken } = require("./middleware/auth");
+const { authenticateToken: verifyToken } = require("./middleware/auth");
+
+// Verifies the JWT, then rejects tokens that belong to deleted accounts
+function authenticateToken(req, res, next) {
+  verifyToken(req, res, async () => {
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: req.user.userId },
+        select: { deletedAt: true }
+      });
+      if (!user || user.deletedAt) {
+        return res.status(401).json({ error: "This account no longer exists" });
+      }
+      next();
+    } catch (error) {
+      console.error("Auth lookup error:", error);
+      res.status(500).json({ error: "Something went wrong" });
+    }
+  });
+}
 
 // Initialize app
 const app = express();
@@ -268,6 +288,78 @@ app.patch("/users/me", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("Error updating user:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete the current user's account (App Store guideline 5.1.1(v)).
+// Personal data is wiped and logins stop working. Projects, escrows and payout
+// records stay (anonymized) because the other party and financial records need them.
+app.delete("/users/me", authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  const involvesUser = { OR: [{ buyerId: userId }, { sellerId: userId }] };
+
+  try {
+    // Money still in escrow has to be released or refunded first
+    const held = await prisma.escrow.count({
+      where: { ...involvesUser, status: { in: ["FUNDED", "AUTHORIZED", "CANCEL_REQUESTED", "DISPUTED"] } }
+    });
+    if (held > 0) {
+      return res.status(409).json({
+        error: `You have ${held} escrow${held === 1 ? "" : "s"} still holding money. Release or refund ${held === 1 ? "it" : "them"} (or wait for a dispute to be resolved) before deleting your account.`
+      });
+    }
+
+    // Unfunded escrows: make sure no half-finished payment can still go through
+    const pending = await prisma.escrow.findMany({
+      where: { ...involvesUser, status: "PENDING", stripePaymentIntentId: { not: null } }
+    });
+    for (const escrow of pending) {
+      const intent = await stripe.paymentIntents.retrieve(escrow.stripePaymentIntentId);
+      if (intent.status === "succeeded" || intent.status === "processing") {
+        return res.status(409).json({ error: "A payment on one of your escrows just went through. Refresh and try again." });
+      }
+      if (intent.status !== "canceled") {
+        await stripe.paymentIntents.cancel(intent.id);
+      }
+    }
+
+    const unusablePassword = await bcrypt.hash(crypto.randomUUID(), 10);
+
+    await prisma.$transaction([
+      prisma.message.deleteMany({ where: { senderId: userId } }),
+      prisma.rFP.updateMany({ where: { customerId: userId, status: "OPEN" }, data: { status: "CLOSED" } }),
+      prisma.bid.updateMany({ where: { vendorId: userId, status: "SUBMITTED" }, data: { status: "REJECTED" } }),
+      prisma.projectVendor.updateMany({ where: { vendorId: userId, status: "INVITED" }, data: { status: "DECLINED" } }),
+      prisma.escrow.updateMany({
+        where: { ...involvesUser, status: "PENDING" },
+        data: { status: "CANCELED", cancelReason: "Account deleted" }
+      }),
+      prisma.user.update({
+        where: { id: userId },
+        data: {
+          email: `deleted-${userId}-${Date.now()}@deleted.gohard.app`,
+          name: "Deleted User",
+          password: unusablePassword,
+          bio: null,
+          services: [],
+          portfolioUrls: [],
+          location: null,
+          phoneNumber: null,
+          profileImageUrl: null,
+          startingPrice: null,
+          instagramHandle: null,
+          websiteUrl: null,
+          yearsInBusiness: null,
+          stripeAccountId: null,
+          deletedAt: new Date()
+        }
+      })
+    ]);
+
+    res.json({ success: true, message: "Your account has been deleted" });
+  } catch (error) {
+    console.error("Delete account error:", error);
+    res.status(500).json({ error: "Couldn't delete your account. Please try again." });
   }
 });
 
@@ -1726,6 +1818,7 @@ app.get("/vendors/search", async (req, res) => {
   try {
     const whereClause = {
       userType: { in: ['VENDOR', 'BOTH'] },
+      deletedAt: null,
       ...(query && {
         OR: [
           { name: { contains: query, mode: 'insensitive' } },
@@ -1767,8 +1860,8 @@ app.get("/vendors/:id", async (req, res) => {
   const vendorId = Number(req.params.id);
   
   try {
-    const vendor = await prisma.user.findUnique({
-      where: { id: vendorId },
+    const vendor = await prisma.user.findFirst({
+      where: { id: vendorId, deletedAt: null },
       select: {
         id: true,
         name: true,

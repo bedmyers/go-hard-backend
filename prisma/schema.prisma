@@ -82,6 +82,8 @@ model User {
   instagramHandle  String?
   websiteUrl       String?
   yearsInBusiness  Int?
+
+  deletedAt        DateTime?   // account deleted: personal data wiped, logins rejected
 }
 
 // ============================================
